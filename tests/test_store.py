@@ -223,6 +223,29 @@ def test_shared_legacy_store_migrates_all_records_into_isolated_project_director
     with sqlite3.connect(legacy_db) as frozen:
         with pytest.raises(sqlite3.IntegrityError,match="migrated"):
             frozen.execute("UPDATE tasks SET title='wrong' WHERE id='a1'")
+        with pytest.raises(sqlite3.IntegrityError,match="migrated"):
+            frozen.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?,?)",("r-old","a1","alpha","tester","{}",now,"old"))
+        with pytest.raises(sqlite3.IntegrityError,match="migrated"):
+            frozen.execute("INSERT INTO lessons VALUES(?,?,?,?,?,?,?,?,?,?)",("l-old","alpha","old","trigger","procedure","[]","","candidate","",now))
+        # FTS5 virtual tables cannot have SQLite triggers. An old index operation
+        # must fail on its guarded source-table write and roll back the FTS change
+        # in the same transaction.
+        old_chunk_count=frozen.execute("SELECT COUNT(*) FROM chunks WHERE project_id='alpha'").fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError,match="migrated"):
+            with frozen:
+                frozen.execute("INSERT INTO chunks(project_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?)",("alpha","__old-process-test__","test",1,1,"temporary"))
+                frozen.execute("INSERT INTO sources(project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes) VALUES(?,?,?,?,?,?)",("alpha","__old-process-test__","test",now,0,0))
+        assert frozen.execute("SELECT COUNT(*) FROM chunks WHERE project_id='alpha'").fetchone()[0]==old_chunk_count
+    assert (alpha/".agentmem"/"PROJECT.md").read_text(encoding="utf-8")=="# Alpha manager brief\nThe old test migration evidence stays verifiable.\n"
+    # The new active project database remains fully writable after the legacy
+    # store has been frozen.
+    active_task=store.create_task("alpha","Post-migration write","Verify active store writes",["receipt saved"])
+    claim=store.claim_task("alpha",active_task["id"],"migration-test")
+    result=store.record_receipt("alpha",active_task["id"],"migration-test",claim["lease_token"],{
+        "status":"done","changed_artifacts":["active project DB"],"checks":["write"],"remaining_work":[],
+        "acceptance_checks":[{"criterion":"receipt saved","met":True,"evidence":"new active DB accepted task receipt"}],
+    },"active-store-write")
+    assert result["status"]=="done"
 
 
 def test_concurrent_first_start_serializes_legacy_migration(tmp_path):
