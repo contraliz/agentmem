@@ -1,6 +1,6 @@
 # Architecture and module boundary
 
-Agent Memory is one reusable project-memory module inside a larger project-work system. It owns project-scoped evidence lookup and durable task/lesson records. It does not own the Codex model/runtime, subagent execution, hosting, scheduler, or a full dashboard.
+Agent Memory is one reusable project-memory module inside a larger project-work system. It owns project-scoped evidence lookup and durable task/lesson records. It does not own the Codex model/runtime, project execution, hosting, scheduler, or a full dashboard.
 
 ```text
 Codex / future manager runtime
@@ -33,7 +33,7 @@ Lessons begin as candidates. An owner reviews them as accepted, rejected, or sup
 | Tool | Purpose |
 |---|---|
 | `projects` | List/register/resolve project identities |
-| `attach_project` | One bounded manager context packet; optional `query` bundles focused cited evidence |
+| `attach_project` | One bounded manager context packet; optional `query` bundles focused cited evidence; `include_sources` opts into the detailed source manifest |
 | `index_project` | Refresh project source snapshot and FTS index |
 | `check_project_changes` | Metadata-only freshness scan; does not read file contents |
 | `retrieve_evidence` | Lexical search with path, line, hash, freshness, and gap |
@@ -50,4 +50,6 @@ CLI commands call the same domain/store methods and do not duplicate memory logi
 ## Current operational limits
 
 The first version uses lexical FTS5 and manual re-indexing. It does not provide file watching, semantic search, automatic extraction/verification of all facts, concurrent multi-machine synchronization, remote hosting, an automatic Codex hook, or autonomous Codex scheduling. MCP tool schemas expose the capabilities; project instructions guide the agent but do not guarantee it will call every tool. Continue to cite evidence and surface missing/stale sources.
+
+For common question answering, `attach_project(project_id, query=...)` combines orientation and up to three capped citation excerpts in one MCP call. This saves one agent/tool round trip when both operations are needed. The normal packet gives the indexed-source count and revision without listing every hash; cited evidence still carries its own source hash. Pass `include_sources=true` when the detailed manifest is needed. Larger or ambiguous questions should use `retrieve_evidence` for more results. Local tool latency does not measure model reasoning or end-to-end answer time.
 

@@ -38,9 +38,9 @@ def projects(action: str = "list", project_id: str = "", root: str = "", descrip
 
 
 @mcp.tool()
-def attach_project(project_id: str, max_chars: int = 6500) -> dict[str, Any]:
-    """Return a bounded project-manager packet: brief, open tasks, accepted lessons, source revisions, and freshness limits."""
-    return _out(store.attach(project_id, max_chars))
+def attach_project(project_id: str, max_chars: int = 6500, query: str = "", include_sources: bool = False) -> dict[str, Any]:
+    """Return bounded project context; add query for focused citations or include_sources for a detailed source manifest."""
+    return _out(store.attach(project_id, max_chars, query, include_sources))
 
 
 @mcp.tool()

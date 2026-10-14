@@ -151,7 +151,7 @@ class MemoryStore:
             is_junction=getattr(path,"is_junction",lambda:False)()
             if path.is_symlink() or is_junction or not resolved.is_file():
                 return False
-            if any(part.lower() in EXCLUDED_DIRS for part in path.relative_to(root).parts[:-1]):
+            if any(part.lower() in EXCLUDED_DIRS or part.lower().endswith(".egg-info") for part in path.relative_to(root).parts[:-1]):
                 return False
             name = path.name.lower()
             if name in SENSITIVE_BASENAMES or SECRET_NAME.search(name) or path.suffix.lower() in SECRET_SUFFIXES:
@@ -172,7 +172,7 @@ class MemoryStore:
         now = time.time()
         with self.connect() as db:
             for parent, dirs, files in os.walk(root, followlinks=False):
-                dirs[:] = sorted(d for d in dirs if d.lower() not in EXCLUDED_DIRS
+                dirs[:] = sorted(d for d in dirs if d.lower() not in EXCLUDED_DIRS and not d.lower().endswith(".egg-info")
                                  and not (Path(parent)/d).is_symlink()
                                  and not getattr((Path(parent)/d),"is_junction",lambda:False)())
                 for filename in sorted(files):
@@ -227,7 +227,7 @@ class MemoryStore:
             previous={r["relpath"]:dict(r) for r in db.execute("SELECT relpath,mtime_ns,size_bytes FROM sources WHERE project_id=?",(project_id,))}
         seen=set(); changed=[]; added=[]; scanned=0; truncated=False
         for parent,dirs,files in os.walk(root,followlinks=False):
-            dirs[:]=sorted(d for d in dirs if d.lower() not in EXCLUDED_DIRS and not (Path(parent)/d).is_symlink() and not getattr((Path(parent)/d),"is_junction",lambda:False)())
+            dirs[:]=sorted(d for d in dirs if d.lower() not in EXCLUDED_DIRS and not d.lower().endswith(".egg-info") and not (Path(parent)/d).is_symlink() and not getattr((Path(parent)/d),"is_junction",lambda:False)())
             for name in sorted(files):
                 path=Path(parent)/name
                 if not self._safe_file(root,path): continue
@@ -305,14 +305,15 @@ class MemoryStore:
                 "gap": "No indexed evidence matched. Index the project or ask a narrower question." if not results else "",
                 "source_revision": self.source_revision(project_id)}
 
-    def attach(self, project_id: str, max_chars: int = 6500) -> dict[str, Any]:
+    def attach(self, project_id: str, max_chars: int = 6500, query: str = "", include_sources: bool = False) -> dict[str, Any]:
         project = self.get_project(project_id)
         max_chars = min(max(max_chars, 1000), 12000)
         change_summary=self.check_project_changes(project_id)
         with self.connect() as db:
             tasks = db.execute("SELECT * FROM tasks WHERE project_id=? AND status IN ('open','in_progress') ORDER BY CASE status WHEN 'in_progress' THEN 0 ELSE 1 END,priority,created_at LIMIT 8", (project_id,)).fetchall()
             accepted = db.execute("SELECT id,title,trigger_text,procedure,evidence,updated_at FROM lessons WHERE project_id=? AND status='accepted' ORDER BY updated_at DESC LIMIT 8", (project_id,)).fetchall()
-            src = db.execute("SELECT relpath,sha256,indexed_at FROM sources WHERE project_id=? ORDER BY relpath LIMIT 100", (project_id,)).fetchall()
+            source_count = db.execute("SELECT count(*) FROM sources WHERE project_id=?", (project_id,)).fetchone()[0]
+            src = db.execute("SELECT relpath,sha256,indexed_at FROM sources WHERE project_id=? ORDER BY relpath LIMIT 100", (project_id,)).fetchall() if include_sources else []
         brief_path = Path(project["root"]) / ".agentmem" / "PROJECT.md"
         brief = brief_path.read_text(encoding="utf-8")[:max_chars] if brief_path.exists() else "No curated .agentmem/PROJECT.md brief yet. Ask questions against indexed source evidence; create a project brief after verifying key facts."
         task_list = []
@@ -329,6 +330,9 @@ class MemoryStore:
                 "manager_brief": brief, "tasks": task_list,
                 "accepted_lessons": [dict(x) | {"evidence": json.loads(x["evidence"])} for x in accepted],
                 "indexed_sources": [{"path":x["relpath"],"sha256":x["sha256"],"indexed_at":x["indexed_at"]} for x in src],
+                "indexed_source_count": source_count,
+                "source_manifest_included": include_sources,
+                "source_manifest_truncated": include_sources and source_count > len(src),
                 "source_revision": self.source_revision(project_id),
                 "source_change_summary": change_summary,
                 "freshness_note": "Path/mtime/size scan does not read content. Run index_project to refresh hashes and evidence.",
@@ -355,6 +359,14 @@ class MemoryStore:
                 card["freshness_note"]="Packet compacted to fit the requested size."
             if len(_json(card)) > max_chars:
                 card={"project":{"id":project_id,"name":project["name"]},"source_revision":self.source_revision(project_id),"truncated":True}
+        if query.strip():
+            evidence = self.search(project_id, query, limit=3)
+            for result in evidence["results"]:
+                original = result["excerpt"]
+                result["excerpt"] = original[:1200]
+                result["excerpt_truncated"] = len(original) > 1200
+            card["question_context"] = evidence
+            card["question_context_note"] = "Focused cited evidence for this question. Ask retrieve_evidence for more or narrower evidence; the service does not generate an answer."
         return card
 
     def create_task(self, project_id: str, title: str, goal: str, acceptance: list[str] | None = None,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             tools=await client.list_tools()
             names={tool.name for tool in tools.tools}
             assert {"projects","attach_project","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","export_project"}.issubset(names)
+            assert all(not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",tool.description or "",re.I) for tool in tools.tools)
             result=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
             assert result.structured_content["id"]=="pilot"
             indexed=await client.call_tool("index_project",{"project_id":"pilot","max_files":100})
@@ -32,12 +34,23 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             attach_ms=(time.perf_counter()-started)*1000
             assert attached.structured_content["project"]["id"]=="pilot"
             assert len(str(attached.structured_content))<6500
+            assert attached.structured_content["indexed_sources"]==[]
+            assert attached.structured_content["indexed_source_count"]==1
+            assert not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",str(attached.structured_content),re.I)
             started=time.perf_counter()
             query=await client.call_tool("retrieve_evidence",{"project_id":"pilot","query":"MCP server"})
             search_ms=(time.perf_counter()-started)*1000
             assert "results" in query.structured_content
             evidence=await client.call_tool("retrieve_evidence",{"project_id":"pilot","query":"retry limit"})
             assert evidence.structured_content["results"][0]["citation"].startswith("README.md#L1-")
+            started=time.perf_counter()
+            combined=await client.call_tool("attach_project",{"project_id":"pilot","query":"What is the retry limit?"})
+            combined_ms=(time.perf_counter()-started)*1000
+            combined_evidence=combined.structured_content["question_context"]
+            assert combined_evidence["results"][0]["citation"].startswith("README.md#L1-")
+            assert combined_evidence["results"][0]["fresh"] is True
+            manifest=await client.call_tool("attach_project",{"project_id":"pilot","include_sources":True})
+            assert manifest.structured_content["indexed_sources"][0]["path"]=="README.md"
             other=tmp_path/"other"; other.mkdir(); (other/"README.md").write_text("completely unrelated notes",encoding="utf-8")
             await client.call_tool("projects",{"action":"register","project_id":"other","root":str(other)})
             await client.call_tool("index_project",{"project_id":"other"})
@@ -58,6 +71,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             task_packet=await client.call_tool("task_context",{"project_id":"pilot","task_id":first_id})
             assert task_packet.structured_content["task"]["id"]==first_id
             assert task_packet.structured_content["applicable_accepted_lessons"]
+            assert not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",str(task_packet.structured_content),re.I)
             cp=await client.call_tool("record_work",{"action":"checkpoint","project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_token":token,"checkpoint":{"last_verified":"retry limit four","next_action":"document it"}})
             assert cp.structured_content["checkpoint"]["last_verified"]=="retry limit four"
             receipt=await client.call_tool("record_work",{"action":"receipt","project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_token":token,"idempotency_key":"test-1","receipt":{"status":"done","lesson_ids":[lesson.structured_content["id"]],"lesson_feedback":"kept work aligned with project evidence","acceptance_checks":[{"criterion":"evidence saved","met":True,"evidence":"README.md#L1-L1"}]}})
@@ -66,6 +80,6 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             exported=await client.call_tool("export_project",{"project_id":"pilot"})
             assert exported.structured_content["lesson_uses"]
             assert attach_ms<2000 and search_ms<2000
-            print(f"stdio probe attach_ms={attach_ms:.1f} search_ms={search_ms:.1f}")
+            print(f"stdio probe attach_ms={attach_ms:.1f} search_ms={search_ms:.1f} combined_attach_query_ms={combined_ms:.1f}")
 
     asyncio.run(exercise())

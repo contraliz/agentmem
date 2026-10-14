@@ -52,6 +52,36 @@ def test_incremental_index_excludes_secrets_and_symlinks(setup):
     assert "SECRET_DO_NOT_INDEX" not in str(result)
 
 
+def test_generated_egg_info_is_excluded_from_index_and_freshness(setup):
+    store,root,_=setup
+    generated=root/"src"/"sample.egg-info"
+    generated.mkdir(parents=True)
+    (generated/"SOURCES.txt").write_text("noise from generated build metadata",encoding="utf-8")
+    (root/"guide.md").write_text("the project answer is grounded in this guide",encoding="utf-8")
+    store.index_project("p")
+    assert store.search("p","generated build metadata")["results"] == []
+    assert not any(".egg-info" in path for path in store.check_project_changes("p")["new_paths"])
+
+
+def test_attach_can_bundle_focused_cited_question_evidence(setup):
+    store,root,_=setup
+    (root/"guide.md").write_text("The retry limit is four attempts.\n" + "detail " * 400,encoding="utf-8")
+    store.index_project("p")
+    context=store.attach("p",query="What is the retry limit?")
+    evidence=context["question_context"]
+    assert evidence["query"]=="What is the retry limit?"
+    assert evidence["results"][0]["citation"].startswith("guide.md#L1-")
+    assert evidence["results"][0]["fresh"] is True
+    assert len(evidence["results"][0]["excerpt"])<=1200
+    assert evidence["results"][0]["excerpt_truncated"] is True
+    plain=store.attach("p")
+    assert "question_context" not in plain
+    assert plain["indexed_sources"]==[] and plain["indexed_source_count"]==1
+    assert plain["source_manifest_included"] is False
+    detailed=store.attach("p",include_sources=True)
+    assert detailed["indexed_sources"][0]["path"]=="guide.md"
+
+
 def test_index_rejects_symlink_escape(setup, tmp_path):
     store,root,_=setup
     outside=tmp_path/"private.md"; outside.write_text("unique external canary",encoding="utf-8")
