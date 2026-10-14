@@ -274,6 +274,18 @@ def test_project_memory_paths_reject_source_overlap_and_implicit_rebind(tmp_path
         store.register_project("overlap",overlapping_source,memory_root=tmp_path/"external-kb")
 
 
+def test_project_store_refuses_a_mismatched_knowledge_manifest(setup):
+    store,_,_=setup
+    manifest=store.memory_root/"p"/".agentmem-project.json"
+    original=manifest.read_text(encoding="utf-8")
+    manifest.write_text('{"project_id":"other","source_root":"wrong","format":1}',encoding="utf-8")
+    try:
+        with pytest.raises(ValueError,match="manifest does not match"):
+            store.connect("p")
+    finally:
+        manifest.write_text(original,encoding="utf-8")
+
+
 def test_retrieval_caps_cites_and_detects_index_revision(setup):
     store,root,_=setup
     (root/"notes.md").write_text("\n".join(f"line {n}" for n in range(1,90))+"\nneedle finding",encoding="utf-8")

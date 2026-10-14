@@ -38,6 +38,8 @@ Merge [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) into that project
 
 `D:\projects\<project_id>\agentmem.sqlite3` is authoritative for that project's tasks, dependencies, claims/checkpoints, receipts, lessons, source hashes, and FTS evidence index. `D:\projects\<project_id>\PROJECT.md` is the curated human-readable brief. `D:\projects\<project_id>\.agentmem-project.json` identifies the KB and source root. The app registry contains only project ID, source root, description, and KB path so it can route requests. Source files stay in their original repositories; the index stores cited text excerpts and hashes, not copies of those repositories.
 
+Before opening a per-project database, the server checks the knowledge-directory manifest and source-root binding. It rejects missing stores, mismatched project identity, and knowledge directories/databases replaced by symlinks or junctions.
+
 On first startup after the upgrade, AgentMem makes a WAL-consistent backup of the former shared database under `.agentmem-data\migration-backups`, copies and verifies every registered project's records into separate stores, then switches the locator registry. It retains the old database as a guarded recovery copy. The original `[local path redacted]\.agentmem\PROJECT.md` remains untouched as a pre-migration copy; the authoritative brief is now `[local path redacted]\PROJECT.md`. Restart/open a new Codex session after the first migration so an older running MCP process does not keep addressing the retired store. For a custom KB location, set `AGENTMEM_MEMORY_ROOT` consistently for both MCP and CLI processes.
 
 ## Use it in Codex

@@ -40,13 +40,33 @@ class MemoryStore:
     def connect(self, project_id: str | None = None) -> sqlite3.Connection:
         path = self.db_path
         if project_id is not None:
-            project = self.get_project(project_id)
-            path = Path(project["memory_root"]) / "agentmem.sqlite3"
+            path = self._project_database_path(project_id)
         db = sqlite3.connect(path, timeout=15, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA busy_timeout=15000")
         return db
+
+    def _project_database_path(self, project_id: str) -> Path:
+        project = self.get_project(project_id)
+        root = Path(project["memory_root"])
+        if root.is_symlink() or getattr(root,"is_junction",lambda:False)():
+            raise ValueError("Registered project knowledge directory cannot be a symlink or junction")
+        resolved_root = root.resolve(strict=True)
+        if resolved_root != root.absolute() or not resolved_root.is_dir():
+            raise ValueError("Registered project knowledge directory moved from its recorded path")
+        manifest = self._manifest_path(resolved_root)
+        if manifest.is_symlink() or not manifest.is_file():
+            raise ValueError("Registered project knowledge directory is missing its manifest")
+        meta = json.loads(manifest.read_text(encoding="utf-8"))
+        if meta.get("project_id") != project_id or Path(meta.get("source_root", "")).expanduser().resolve() != Path(project["root"]).expanduser().resolve():
+            raise ValueError("Project knowledge manifest does not match the registered project")
+        path = resolved_root / "agentmem.sqlite3"
+        if path.is_symlink() or getattr(path,"is_junction",lambda:False)() or not path.is_file():
+            raise ValueError("Registered project knowledge database is missing or unsafe")
+        if path.resolve(strict=True).parent != resolved_root:
+            raise ValueError("Registered project knowledge database escaped its directory")
+        return path
 
     def _init_db(self) -> None:
         self.memory_root.mkdir(parents=True, exist_ok=True)
