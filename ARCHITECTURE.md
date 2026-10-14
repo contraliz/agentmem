@@ -6,21 +6,28 @@ Agent Memory is one reusable project-memory module inside a larger project-work 
 Codex / future manager runtime
       | MCP or CLI
       v
-domain + SQLite service ---- curated Markdown under each project root
+small locator registry
+      | project_id -> source_root + knowledge_root
+      v
+per-project SQLite + curated Markdown under D:/projects/<project_id>
       |                          (authoritative intent/decisions)
       +-- source allowlist and incremental FTS index
       +-- projects, tasks/dependencies/leases/checkpoints
       +-- append-only receipts and lesson review/application
+      ^
+      | original project source roots remain where they are; indexed evidence stores paths, hashes, and excerpts
 ```
 
 ## Authority and records
 
-- Curated `.agentmem/PROJECT.md` in each project is the editable manager brief. Project source files and explicit decisions remain evidence. The MCP writes this one service-owned Markdown location and never accepts arbitrary output paths.
-- SQLite (`agentmem.sqlite3`) is authoritative for task status, dependency edges, lease ownership, checkpoints, receipts, and lesson review status. A source index is derived from files and can be rebuilt.
+- Each project has an independent AgentMem knowledge directory, default `D:/projects/<project_id>`. Its `PROJECT.md` is the editable manager brief; its `agentmem.sqlite3` is authoritative for task status, dependency edges, lease ownership, checkpoints, receipts, lesson review status, and the rebuildable evidence index. The MCP writes only this service-owned brief and never accepts arbitrary output paths.
+- The app-level registry contains only `project_id`, source root, description, and knowledge-directory path. It routes each request to that project's database; all project content and working state lives in the corresponding per-project directory. `AGENTMEM_DATA_DIR` controls the registry and migration backups, while `AGENTMEM_MEMORY_ROOT` controls the default knowledge-directory parent.
+- Source repositories remain at their existing roots. Index records retain relative paths, SHA-256, line bounds, and excerpt text; they are not copies of the original repository. A citation beginning `@memory/` resolves under the project's KB directory, while other citations resolve under the registered source root.
 - Every indexed source records a project ID, relative path, SHA-256, and index time. FTS chunks carry line bounds and source hash. Search returns excerpts and citations rather than unverified “facts.”
 - Attach and task context perform a metadata-only scan of safe text paths (relative path, size, and modification time). It can flag changed/new/deleted paths but cannot verify content or find a change if timestamps and sizes are preserved; `index_project` hashes content and refreshes evidence.
 - Project identity is an explicit ID. Optional cwd resolution succeeds only inside a registered root and chooses the most specific root. No process-wide current project is shared.
-- `AGENTMEM_DATA_DIR` controls local runtime storage. SQLite `user_version` tracks schema versions; the current migration upgrades the original index table with metadata needed for fast freshness scans. Export uses a versioned JSON envelope.
+- SQLite `user_version` tracks schema versions; the current migration upgrades the original index table with metadata needed for fast freshness scans. Export uses a versioned JSON envelope.
+- On upgrade, a WAL-consistent backup is kept under `<data_dir>/migration-backups`; each old project's records are copied into its own database and validated against the backup before the new locator registry becomes active. The original shared database stays in place as a retired recovery copy, with write guards on relational tables. Running pre-upgrade MCP processes must be restarted to use the new store.
 
 ## Task state
 
@@ -32,7 +39,7 @@ Lessons begin as candidates. An owner reviews them as accepted, rejected, or sup
 
 | Tool | Purpose |
 |---|---|
-| `projects` | List/register/resolve project identities |
+| `projects` | List/register/resolve source roots and isolated knowledge-directory locations |
 | `attach_project` | One bounded manager context packet; optional `query` bundles focused cited evidence; `include_sources` opts into the detailed source manifest |
 | `index_project` | Refresh project source snapshot and FTS index |
 | `check_project_changes` | Metadata-only freshness scan; does not read file contents |
@@ -42,7 +49,7 @@ Lessons begin as candidates. An owner reviews them as accepted, rejected, or sup
 | `task_context` | Bounded evidence/lesson/checkpoint packet for one task |
 | `record_work` | Checkpoint, renew/release, or receipt under claim |
 | `lessons` | Retrieve accepted, propose candidate, review, or show |
-| `update_project_brief` | Write only `.agentmem/PROJECT.md` under the registered root |
+| `update_project_brief` | Write only `PROJECT.md` under the registered knowledge directory |
 | `export_project` | Portable JSON export of task, receipt, dependency, and lesson state |
 
 CLI commands call the same domain/store methods and do not duplicate memory logic. Future parent-system adapters can use Python service methods or add an API without changing the record model. Planned extension points include semantic retrieval, external source connectors, a dashboard, Postgres for multi-host writes, and a separately authorized job runner. None is required by the current local module.

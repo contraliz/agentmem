@@ -17,19 +17,20 @@ def emit(value: Any) -> None:
 def main() -> None:
     parser=argparse.ArgumentParser(prog="agentmem",description="Project-scoped memory and task CLI")
     parser.add_argument("--data-dir",default=os.environ.get("AGENTMEM_DATA_DIR"))
+    parser.add_argument("--memory-root",default=os.environ.get("AGENTMEM_MEMORY_ROOT"))
     sub=parser.add_subparsers(dest="command",required=True)
-    p=sub.add_parser("project",help="register/list projects"); p.add_argument("action",choices=["list","register","resolve"]); p.add_argument("--id",default=""); p.add_argument("--root",default=""); p.add_argument("--cwd",default=""); p.add_argument("--description",default="")
+    p=sub.add_parser("project",help="register/list projects"); p.add_argument("action",choices=["list","register","resolve"]); p.add_argument("--id",default=""); p.add_argument("--root",default=""); p.add_argument("--cwd",default=""); p.add_argument("--description",default=""); p.add_argument("--memory-root",default=None)
     p=sub.add_parser("attach"); p.add_argument("project_id"); p.add_argument("--max-chars",type=int,default=6500)
     p=sub.add_parser("index"); p.add_argument("project_id"); p.add_argument("--max-files",type=int,default=5000)
     p=sub.add_parser("check"); p.add_argument("project_id"); p.add_argument("--max-files",type=int,default=5000)
     p=sub.add_parser("search"); p.add_argument("project_id"); p.add_argument("query"); p.add_argument("--limit",type=int,default=5)
     p=sub.add_parser("task"); p.add_argument("action",choices=["create","list","show","update"]); p.add_argument("project_id"); p.add_argument("--id",default=""); p.add_argument("--title",default=""); p.add_argument("--goal",default=""); p.add_argument("--acceptance",action="append",default=None); p.add_argument("--depends-on",action="append",default=None); p.add_argument("--authorized-path",action="append",default=None); p.add_argument("--blocked-reason",default=None); p.add_argument("--priority",type=int,default=None); p.add_argument("--status",default="all")
     p=sub.add_parser("export"); p.add_argument("project_id")
-    args=parser.parse_args(); store=MemoryStore(args.data_dir)
+    args=parser.parse_args(); store=MemoryStore(args.data_dir,args.memory_root)
     try:
         if args.command=="project":
             if args.action=="list": result={"projects":store.list_projects()}
-            elif args.action=="register": result=store.register_project(args.id,args.root,args.description)
+            elif args.action=="register": result=store.register_project(args.id,args.root,args.description,args.memory_root)
             else: result=store.resolve_project(args.id or None,args.cwd or None)
         elif args.command=="attach": result=store.attach(args.project_id,args.max_chars)
         elif args.command=="index": result=store.index_project(args.project_id,args.max_files)

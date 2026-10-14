@@ -18,6 +18,15 @@ def _claim_in_process(data_dir: str, task_id: str, gate, queue, owner: str):
     except ValueError: queue.put(("rejected",owner))
 
 
+def _initialize_migrated_store(data_dir: str, memory_root: str, gate, queue):
+    gate.wait()
+    try:
+        store=MemoryStore(data_dir,memory_root)
+        queue.put(("ok",len(store.list_projects())))
+    except Exception as exc:
+        queue.put(("error",type(exc).__name__+":"+str(exc)))
+
+
 @pytest.fixture
 def setup(tmp_path: Path):
     root=tmp_path/"project"; root.mkdir()
@@ -45,7 +54,7 @@ def test_incremental_index_excludes_secrets_and_symlinks(setup):
     (root/"credentials.json").write_text("alpha credential",encoding="utf-8")
     (root/"node_modules").mkdir(); (root/"node_modules"/"lib.md").write_text("alpha ignored",encoding="utf-8")
     first=store.index_project("p"); second=store.index_project("p")
-    assert first["files_changed"]==1
+    assert first["files_changed"]==2
     assert second["files_changed"]==0
     result=store.search("p","alpha")
     assert len(result["results"])==1 and result["results"][0]["citation"].startswith("guide.md#L")
@@ -76,10 +85,10 @@ def test_attach_can_bundle_focused_cited_question_evidence(setup):
     assert evidence["results"][0]["excerpt_truncated"] is True
     plain=store.attach("p")
     assert "question_context" not in plain
-    assert plain["indexed_sources"]==[] and plain["indexed_source_count"]==1
+    assert plain["indexed_sources"]==[] and plain["indexed_source_count"]==2
     assert plain["source_manifest_included"] is False
     detailed=store.attach("p",include_sources=True)
-    assert detailed["indexed_sources"][0]["path"]=="guide.md"
+    assert {item["path"] for item in detailed["indexed_sources"]}=={"guide.md","@memory/PROJECT.md"}
 
 
 def test_index_rejects_symlink_escape(setup, tmp_path):
@@ -101,7 +110,7 @@ def test_index_does_not_traverse_windows_junction(setup, tmp_path):
     if result.returncode!=0: pytest.skip("Windows junction creation was unavailable")
     store.index_project("p")
     assert not store.search("p","junction canary")["results"]
-    with store.connect() as db:
+    with store.connect("p") as db:
         assert db.execute("SELECT 1 FROM sources WHERE project_id='p' AND relpath LIKE 'external-directory/%'").fetchone() is None
 
 
@@ -138,7 +147,7 @@ def test_attach_caps_freshness_paths_for_small_packet_budget(setup):
         (root/name).write_text("small file",encoding="utf-8")
     packet=store.attach("p",max_chars=1000)
     assert len(json.dumps(packet,ensure_ascii=False,separators=(",",":")))<=1000
-    assert packet["source_change_summary"]["new_count"]==30 or packet.get("truncated")
+    assert packet["source_change_summary"]["new_count"]==31 or packet.get("truncated")
 
 
 def test_schema_v1_migrates_deterministically(tmp_path):
@@ -149,10 +158,120 @@ def test_schema_v1_migrates_deterministically(tmp_path):
     db.execute("CREATE TABLE sources(id INTEGER PRIMARY KEY,project_id TEXT NOT NULL,relpath TEXT NOT NULL,sha256 TEXT NOT NULL,indexed_at REAL NOT NULL,UNIQUE(project_id,relpath))")
     db.execute("PRAGMA user_version=1"); db.commit(); db.close()
     migrated=MemoryStore(data)
+    assert migrated.list_projects()==[]
+    assert migrated.db_path.exists()
     with migrated.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0]==2
-        cols={row[1] for row in conn.execute("PRAGMA table_info(sources)")}
-    assert {"mtime_ns","size_bytes"}.issubset(cols)
+        assert "memory_root" in {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+
+
+def test_shared_legacy_store_migrates_all_records_into_isolated_project_directories(tmp_path):
+    import hashlib
+    import json
+    import sqlite3
+
+    data=tmp_path/"legacy-state"; data.mkdir()
+    memory=tmp_path/"projects"
+    alpha=tmp_path/"alpha"; alpha.mkdir()
+    beta=tmp_path/"beta"; beta.mkdir()
+    old_brief=alpha/".agentmem"/"PROJECT.md"; old_brief.parent.mkdir()
+    old_brief.write_text("# Alpha manager brief\nThe old test migration evidence stays verifiable.\n",encoding="utf-8")
+    legacy_db=data/"agentmem.sqlite3"
+    builder=MemoryStore(data/"builder",memory_root=tmp_path/"builder-kbs")
+    builder._create_project_database(legacy_db)
+    now=time.time(); source_text=old_brief.read_text(encoding="utf-8"); digest=hashlib.sha256(source_text.encode()).hexdigest()
+    db=sqlite3.connect(legacy_db)
+    db.execute("INSERT INTO projects VALUES(?,?,?,?,?)",("alpha","alpha",str(alpha),"alpha desc",now))
+    db.execute("INSERT INTO projects VALUES(?,?,?,?,?)",("beta","beta",str(beta),"beta desc",now))
+    db.execute("INSERT INTO sources(project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes) VALUES(?,?,?,?,?,?)",("alpha",".agentmem/PROJECT.md",digest,now,old_brief.stat().st_mtime_ns,old_brief.stat().st_size))
+    db.execute("INSERT INTO chunks(project_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?)",("alpha",".agentmem/PROJECT.md",digest,1,2,source_text.strip()))
+    db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,status,acceptance,authorized_paths,owner,lease_token,lease_until,source_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("a1","alpha","First","Preserve evidence",1,"done","[\"verified\"]","[]","","",0,"old-revision",now,now))
+    db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,status,acceptance,authorized_paths,owner,lease_token,lease_until,source_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("a2","alpha","Second","Remain queued",2,"open","[]","[]","","",0,"old-revision",now,now))
+    db.execute("INSERT INTO dependencies(task_id,depends_on) VALUES(?,?)",("a2","a1"))
+    receipt_body=json.dumps({"status":"done","acceptance_checks":[{"criterion":"verified","met":True,"evidence":"test evidence"}]})
+    db.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?,?)",("r1","a1","alpha","tester",receipt_body,now,"idem"))
+    db.execute("INSERT INTO lessons VALUES(?,?,?,?,?,?,?,?,?,?)",("l1","alpha","Use evidence","before answering","cite the verified project brief","[\"@memory/PROJECT.md#L1-L2\"]","preserved","accepted","",now))
+    db.execute("INSERT INTO lesson_uses VALUES(?,?,?,?)",("l1","r1","helped",now))
+    db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,status,acceptance,authorized_paths,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",("b1","beta","Isolated","Keep separate",3,"open","[]","[]",now,now))
+    db.commit(); db.close()
+
+    store=MemoryStore(data,memory)
+    projects={p["id"]:p for p in store.list_projects()}
+    assert set(projects)=={"alpha","beta"}
+    assert Path(projects["alpha"]["memory_root"])==memory/"alpha"
+    assert Path(projects["beta"]["root"])==beta
+    assert (memory/"alpha"/"PROJECT.md").read_text(encoding="utf-8")==old_brief.read_text(encoding="utf-8")
+    assert not (memory/"beta"/"PROJECT.md").read_text(encoding="utf-8").startswith("# Alpha")
+    assert store.get_task("alpha","a2")["dependencies"]==["a1"]
+    assert store.get_task("beta","b1")["title"]=="Isolated"
+    assert store.export_project("alpha")["receipts"][0]["id"]=="r1"
+    assert store.export_project("alpha")["lesson_uses"][0]["outcome"]=="helped"
+    cited=store.search("alpha","old test migration evidence")
+    assert cited["results"][0]["citation"].startswith("@memory/PROJECT.md#L1-")
+    assert cited["results"][0]["fresh"] is True
+    assert store.search("beta","old test migration evidence")["results"]==[]
+    with store.connect("alpha") as a_db, store.connect("beta") as b_db:
+        assert a_db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]==2
+        assert b_db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]==1
+        assert a_db.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
+        assert b_db.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
+    backup_dir=data/"migration-backups"
+    backups=list(backup_dir.glob("legacy-*.sqlite3"))
+    assert backups
+    assert not Path(str(backups[0])+"-wal").exists()
+    restored=MemoryStore(data,memory)
+    assert restored.get_task("alpha","a2")["id"]=="a2"
+    with sqlite3.connect(legacy_db) as frozen:
+        with pytest.raises(sqlite3.IntegrityError,match="migrated"):
+            frozen.execute("UPDATE tasks SET title='wrong' WHERE id='a1'")
+
+
+def test_concurrent_first_start_serializes_legacy_migration(tmp_path):
+    import sqlite3
+    data=tmp_path/"state"; data.mkdir(); memory=tmp_path/"projects"
+    source=tmp_path/"source"; source.mkdir()
+    builder=MemoryStore(data/"schema",memory_root=tmp_path/"schema-kbs")
+    legacy=data/"agentmem.sqlite3"; builder._create_project_database(legacy)
+    with sqlite3.connect(legacy) as db:
+        db.execute("INSERT INTO projects VALUES(?,?,?,?,?)",("p","p",str(source),"parallel migration",time.time()))
+    ctx=multiprocessing.get_context("spawn"); gate=ctx.Event(); queue=ctx.Queue()
+    workers=[ctx.Process(target=_initialize_migrated_store,args=(str(data),str(memory),gate,queue)) for _ in range(2)]
+    [p.start() for p in workers]; gate.set(); [p.join(30) for p in workers]
+    assert all(p.exitcode==0 for p in workers)
+    results=[queue.get(timeout=2) for _ in workers]
+    assert sorted(results)==[("ok",1),("ok",1)]
+    store=MemoryStore(data,memory)
+    assert [p["id"] for p in store.list_projects()]==["p"]
+    with store.connect("p") as db: assert db.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
+
+
+def test_project_brief_is_written_only_to_external_knowledge_directory(setup):
+    store,root,_=setup
+    old=root/".agentmem"/"PROJECT.md"; old.parent.mkdir(); old.write_text("old source copy",encoding="utf-8")
+    store.index_project("p")
+    result=store.update_project_brief("p","# Updated\nExternal project knowledge only.\n")
+    assert Path(result["path"])==store.memory_root/"p"/"PROJECT.md"
+    assert Path(result["path"]).read_text(encoding="utf-8").startswith("# Updated")
+    assert old.read_text(encoding="utf-8")=="old source copy"
+    assert "@memory/PROJECT.md" in store.check_project_changes("p")["changed_paths"]
+    store.index_project("p")
+    hit=store.search("p","External project knowledge")["results"][0]
+    assert hit["citation"].startswith("@memory/PROJECT.md#L") and hit["fresh"] is True
+
+
+def test_project_memory_paths_reject_source_overlap_and_implicit_rebind(tmp_path):
+    data=tmp_path/"state"; store=MemoryStore(data,memory_root=tmp_path/"kbs")
+    source=tmp_path/"source"; source.mkdir()
+    with pytest.raises(ValueError,match="separate"):
+        store.register_project("bad",source,memory_root=source/".agentmem")
+    store.register_project("safe",source)
+    with pytest.raises(ValueError,match="already bound"):
+        store.register_project("safe",source,memory_root=tmp_path/"other-memory")
+    custom_source=tmp_path/"custom-source"; custom_source.mkdir()
+    custom=store.register_project("custom",custom_source,memory_root=tmp_path/"external-kb"/"custom")
+    assert Path(custom["memory_root"])==tmp_path/"external-kb"/"custom"
+    overlapping_source=tmp_path/"another-source"; overlapping_source.mkdir()
+    with pytest.raises(ValueError,match="overlaps another project's knowledge base"):
+        store.register_project("overlap",overlapping_source,memory_root=tmp_path/"external-kb")
 
 
 def test_retrieval_caps_cites_and_detects_index_revision(setup):
@@ -226,7 +345,7 @@ def test_atomic_claim_across_processes(setup):
 def test_expired_lease_reclaim_and_receipt_completion_evidence(setup):
     store,_,_=setup; task=store.create_task("p","work","do work",["accept"])
     c=store.claim_task("p",task["id"],"one",60)
-    with store.connect() as db: db.execute("UPDATE tasks SET lease_until=? WHERE id=?",(time.time()-5,task["id"]))
+    with store.connect("p") as db: db.execute("UPDATE tasks SET lease_until=? WHERE id=?",(time.time()-5,task["id"]))
     c2=store.claim_task("p",task["id"],"two",60)
     assert c2["task"]["owner"]=="two"
     bad=store.record_receipt("p",task["id"],"two",c2["lease_token"],{"status":"done","acceptance_checks":[{"criterion":"accept","met":True}]},"k1")
@@ -263,7 +382,7 @@ def test_receipt_tracks_applied_accepted_lesson_and_blocking(setup):
        {"status":"done","lesson_ids":[lesson["id"]],"lesson_feedback":"prevented a mismatch",
         "acceptance_checks":[{"criterion":"test evidence","met":True,"evidence":"test passed"}]},"lesson-run")
     assert result["status"]=="done"
-    with store.connect() as db:
+    with store.connect("p") as db:
         uses=db.execute("SELECT outcome FROM lesson_uses WHERE lesson_id=?",(lesson["id"],)).fetchall()
     assert uses[0]["outcome"]=="prevented a mismatch"
 
@@ -275,7 +394,7 @@ def test_restart_persistence_and_export(setup):
     assert restored.get_task("p",task["id"])["title"]=="persist"
     exported=restored.export_project("p")
     assert exported["schema_version"]==1 and exported["tasks"]
-    with restored.connect() as db: assert db.execute("PRAGMA user_version").fetchone()[0]==2
+    with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==2
 
 
 def test_task_context_is_bounded_and_reports_indexed_revision_change(setup):

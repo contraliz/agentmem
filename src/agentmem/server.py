@@ -3,9 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
 from typing import Any
-import uuid
 
 from mcp.server.mcpserver import MCPServer
 
@@ -13,7 +11,7 @@ from .store import MemoryStore
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("agentmem")
-store = MemoryStore(os.environ.get("AGENTMEM_DATA_DIR"))
+store = MemoryStore(os.environ.get("AGENTMEM_DATA_DIR"), os.environ.get("AGENTMEM_MEMORY_ROOT"))
 mcp = MCPServer(
     "agentmem",
     instructions=(
@@ -29,10 +27,10 @@ def _out(value: Any) -> dict[str, Any]:
 
 
 @mcp.tool()
-def projects(action: str = "list", project_id: str = "", root: str = "", description: str = "", cwd: str = "") -> dict[str, Any]:
+def projects(action: str = "list", project_id: str = "", root: str = "", description: str = "", cwd: str = "", memory_root: str = "") -> dict[str, Any]:
     """List or register projects, or resolve a project from a registered working directory."""
     if action == "list": return _out({"projects": store.list_projects()})
-    if action == "register": return _out(store.register_project(project_id, root, description))
+    if action == "register": return _out(store.register_project(project_id, root, description, memory_root or None))
     if action == "resolve": return _out(store.resolve_project(project_id or None, cwd or None))
     raise ValueError("action must be list, register, or resolve")
 
@@ -45,13 +43,13 @@ def attach_project(project_id: str, max_chars: int = 6500, query: str = "", incl
 
 @mcp.tool()
 def index_project(project_id: str, max_files: int = 5000) -> dict[str, Any]:
-    """Incrementally index safe text files under the registered project root, with path/hash/line provenance."""
+    """Incrementally index safe text files under the source root and project knowledge directory, with path/hash/line provenance."""
     return _out(store.index_project(project_id, max_files))
 
 
 @mcp.tool()
 def check_project_changes(project_id: str, max_files: int = 5000) -> dict[str, Any]:
-    """Quickly compare project paths, timestamps, and sizes to the index without reading file contents."""
+    """Quickly compare source-root and project-knowledge paths, timestamps, and sizes without reading file contents."""
     return _out(store.check_project_changes(project_id,max_files))
 
 
@@ -119,22 +117,8 @@ def lessons(action: str, project_id: str, query: str = "", lesson_id: str = "", 
 
 @mcp.tool()
 def update_project_brief(project_id: str, markdown: str) -> dict[str, Any]:
-    """Write curated project context only to the service-owned .agentmem/PROJECT.md file under that project's root."""
-    project=store.get_project(project_id)
-    if len(markdown)>24000: raise ValueError("brief must be 24000 characters or fewer")
-    root=Path(project["root"]).resolve(strict=True)
-    folder=root/".agentmem"
-    if folder.is_symlink(): raise ValueError("Project brief directory cannot be a symlink")
-    folder.mkdir(exist_ok=True)
-    resolved_folder=folder.resolve(strict=True)
-    try: resolved_folder.relative_to(root)
-    except ValueError as exc: raise ValueError("brief path escaped its project root") from exc
-    destination=resolved_folder/"PROJECT.md"
-    if destination.is_symlink(): raise ValueError("Project brief file cannot be a symlink")
-    temp=resolved_folder/f"PROJECT.{uuid.uuid4().hex}.tmp"
-    with temp.open("x",encoding="utf-8") as stream: stream.write(markdown)
-    temp.replace(destination)
-    return _out({"project_id":project_id,"path":destination.relative_to(root).as_posix(),"characters":len(markdown)})
+    """Write curated project context only to the service-owned PROJECT.md file under that project's knowledge directory."""
+    return _out(store.update_project_brief(project_id,markdown))
 
 
 @mcp.tool()

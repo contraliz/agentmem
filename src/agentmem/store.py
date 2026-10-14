@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 import uuid
@@ -12,7 +13,8 @@ from typing import Any
 
 
 DEFAULT_DATA = Path(os.environ.get("AGENTMEM_DATA_DIR", Path.home() / ".agentmem"))
-EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "target", "__pycache__", ".agentmem-data", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
+DEFAULT_MEMORY_ROOT = Path(os.environ.get("AGENTMEM_MEMORY_ROOT", "D:/projects" if os.name == "nt" else Path.home() / "projects"))
+EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "target", "__pycache__", ".agentmem-data", ".agentmem", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
 SECRET_NAME = re.compile(r"(^|[._-])(\.env(?:\..*)?|secrets?|credentials?)([._-]|$)", re.I)
 SECRET_SUFFIXES = {".pem", ".key", ".token", ".secret", ".p12", ".pfx", ".cer", ".crt", ".sqlite", ".db"}
 SENSITIVE_BASENAMES = {".npmrc", ".pypirc", ".netrc", "id_rsa", "id_ed25519", "id_ecdsa"}
@@ -25,26 +27,60 @@ def _json(value: Any) -> str:
 
 
 class MemoryStore:
-    def __init__(self, data_dir: Path | str | None = None):
+    def __init__(self, data_dir: Path | str | None = None, memory_root: Path | str | None = None):
         self.data_dir = Path(data_dir or DEFAULT_DATA).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.data_dir / "agentmem.sqlite3"
+        env_data = os.environ.get("AGENTMEM_DATA_DIR")
+        uses_configured_data = bool(data_dir is not None and env_data and Path(env_data).expanduser().resolve() == Path(data_dir).expanduser().resolve())
+        chosen_memory_root = memory_root or (DEFAULT_MEMORY_ROOT if data_dir is None or uses_configured_data or os.environ.get("AGENTMEM_MEMORY_ROOT") else Path(data_dir).expanduser().resolve().parent / "projects")
+        self.memory_root = Path(chosen_memory_root).expanduser().resolve()
+        self.db_path = self.data_dir / "registry.sqlite3"
         self._init_db()
 
-    def connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
+    def connect(self, project_id: str | None = None) -> sqlite3.Connection:
+        path = self.db_path
+        if project_id is not None:
+            project = self.get_project(project_id)
+            path = Path(project["memory_root"]) / "agentmem.sqlite3"
+        db = sqlite3.connect(path, timeout=15, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA busy_timeout=15000")
         return db
 
     def _init_db(self) -> None:
+        self.memory_root.mkdir(parents=True, exist_ok=True)
+        legacy = self.data_dir / "agentmem.sqlite3"
         with self.connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
-            current_schema = db.execute("PRAGMA user_version").fetchone()[0]
-            if current_schema > 2:
-                raise RuntimeError(f"Database schema {current_schema} is newer than this Agent Memory version")
-            db.executescript("""
+            db.execute("""CREATE TABLE IF NOT EXISTS projects(
+              id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
+              description TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, memory_root TEXT NOT NULL UNIQUE)""")
+            cols = {r[1] for r in db.execute("PRAGMA table_info(projects)")}
+            if "memory_root" not in cols:
+                db.execute("ALTER TABLE projects ADD COLUMN memory_root TEXT NOT NULL DEFAULT ''")
+                rows = db.execute("SELECT id FROM projects").fetchall()
+                for row in rows:
+                    db.execute("UPDATE projects SET memory_root=? WHERE id=?", (str((self.memory_root / row[0]).resolve()), row[0]))
+            db.execute("PRAGMA user_version=1")
+        if legacy.exists():
+            with self.connect() as db:
+                count = db.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+            if not count:
+                self._migrate_legacy(legacy)
+        if self.db_path.exists():
+            self._migrate_registry_if_legacy_rows()
+
+    def _create_project_database(self, db_path: Path) -> None:
+        db = sqlite3.connect(db_path, timeout=15, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA journal_mode=WAL")
+        current_schema = db.execute("PRAGMA user_version").fetchone()[0]
+        if current_schema > 2:
+            db.close()
+            raise RuntimeError(f"Database schema {current_schema} is newer than this Agent Memory version")
+        db.executescript("""
             CREATE TABLE IF NOT EXISTS projects(
               id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL UNIQUE,
               description TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL);
@@ -85,28 +121,331 @@ class MemoryStore:
             CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id,status,priority,created_at);
             CREATE INDEX IF NOT EXISTS idx_dependencies_target ON dependencies(depends_on);
             """)
-            if current_schema == 1:
-                columns={r[1] for r in db.execute("PRAGMA table_info(sources)")}
-                if "mtime_ns" not in columns: db.execute("ALTER TABLE sources ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0")
-                if "size_bytes" not in columns: db.execute("ALTER TABLE sources ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0")
-            if current_schema < 2:
-                db.execute("PRAGMA user_version=2")
+        if current_schema == 1:
+            columns={r[1] for r in db.execute("PRAGMA table_info(sources)")}
+            if "mtime_ns" not in columns: db.execute("ALTER TABLE sources ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0")
+            if "size_bytes" not in columns: db.execute("ALTER TABLE sources ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0")
+        if current_schema < 2:
+            db.execute("PRAGMA user_version=2")
+        db.close()
 
-    def register_project(self, project_id: str, root: str | Path, description: str = "") -> dict[str, Any]:
+    def _migrate_registry_if_legacy_rows(self) -> None:
+        with self.connect() as db:
+            cols = {r[1] for r in db.execute("PRAGMA table_info(projects)")}
+            if "memory_root" not in cols:
+                return
+            rows = db.execute("SELECT id,root,memory_root FROM projects").fetchall()
+        # Registry created by a prior version can contain only locator rows. Never move data implicitly.
+        for row in rows:
+            if not row[2]:
+                target = (self.memory_root / row[0]).resolve()
+                with self.connect() as db:
+                    db.execute("UPDATE projects SET memory_root=? WHERE id=?", (str(target), row[0]))
+
+    def _safe_memory_path(self, project_id: str, root: Path, requested: Path | str | None = None) -> Path:
+        path = Path(requested).expanduser().resolve() if requested else (self.memory_root / project_id).resolve()
+        base = self.memory_root.resolve()
+        if path == base:
+            raise ValueError("Project knowledge directory must be a dedicated per-project subdirectory, not the memory root itself")
+        if path == self.data_dir or path in self.data_dir.parents or self.data_dir in path.parents:
+            raise ValueError("Project knowledge directory must be separate from the app registry and backup directory")
+        if path == root or path in root.parents or root in path.parents:
+            raise ValueError("Project memory directory must be separate from and not contain the source root")
+        # Prevent a project's KB directory from colliding with another source or memory root.
+        for other in self.list_projects():
+            if other["id"] == project_id:
+                continue
+            other_root = Path(other["root"]).resolve()
+            other_memory = Path(other["memory_root"]).resolve()
+            if path == other_root or path in other_root.parents or other_root in path.parents:
+                raise ValueError("Project memory directory overlaps another registered source root")
+            if path == other_memory or path in other_memory.parents or other_memory in path.parents:
+                raise ValueError("Project memory directory overlaps another project's knowledge base")
+        return path
+
+    def _project_brief_path(self, project: dict[str, Any]) -> Path:
+        return Path(project["memory_root"]) / "PROJECT.md"
+
+    def _manifest_path(self, memory_root: Path) -> Path:
+        return memory_root / ".agentmem-project.json"
+
+    def _remove_owned_stage(self, stage: Path, parent: Path, project_id: str) -> None:
+        stage_resolved = stage.resolve(strict=True)
+        parent_resolved = parent.resolve(strict=True)
+        if stage_resolved.parent != parent_resolved or not stage_resolved.name.startswith(f".{project_id}"):
+            raise ValueError(f"Refusing to remove a staging path outside its intended parent: {stage_resolved}")
+        marker = self._manifest_path(stage_resolved)
+        if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")).get("project_id") != project_id:
+            raise ValueError(f"Refusing to remove staging directory without matching AgentMem marker: {stage_resolved}")
+        shutil.rmtree(stage_resolved)
+
+    def _write_project_manifest(self, path: Path, project_id: str, source_root: Path) -> None:
+        self._manifest_path(path).write_text(_json({"project_id": project_id, "source_root": str(source_root), "format": 1}), encoding="utf-8")
+
+    def _migrate_legacy(self, legacy_path: Path) -> None:
+        """Split the old shared store into per-project databases before exposing the new registry."""
+        self.memory_root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime()) + "-" + uuid.uuid4().hex[:8]
+        backups = self.data_dir / "migration-backups"
+        backups.mkdir(parents=True, exist_ok=True)
+        backup_path = backups / f"legacy-{stamp}.sqlite3"
+        # sqlite backup captures committed data from WAL without copying a live DB file bytewise.
+        source = sqlite3.connect(legacy_path, timeout=30)
+        backup = sqlite3.connect(backup_path)
+        try:
+            source.backup(backup)
+            backup.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            backup.execute("PRAGMA journal_mode=DELETE")
+            backup.commit()
+        finally:
+            backup.close()
+            source.close()
+        snapshot = sqlite3.connect(f"file:{backup_path.as_posix()}?mode=ro", uri=True)
+        migration_already_completed = False
+        try:
+            integrity = snapshot.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise RuntimeError(f"Legacy backup failed SQLite integrity check: {integrity}")
+            if not snapshot.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'").fetchone():
+                snapshot.close()
+                return
+            projects = [dict(zip([c[0] for c in snapshot.execute("SELECT * FROM projects").description], row))
+                        for row in snapshot.execute("SELECT * FROM projects").fetchall()]
+            if not projects:
+                snapshot.close()
+                return
+            with self.connect() as registry:
+                registry.execute("BEGIN IMMEDIATE")
+                if registry.execute("SELECT 1 FROM projects LIMIT 1").fetchone():
+                    # Another startup may have completed the first migration while this process made its backup.
+                    registry.commit()
+                    migration_already_completed = True
+                if not migration_already_completed:
+                    for p in projects:
+                        project_id = self._valid_id(p["id"])
+                        source_root = Path(p["root"]).expanduser().resolve()
+                        memory = self._safe_memory_path(project_id, source_root)
+                        brief = source_root / ".agentmem" / "PROJECT.md"
+                        remap_brief = brief.is_file() and not brief.is_symlink()
+                        if memory.exists():
+                            manifest = self._manifest_path(memory)
+                            existing_db = memory / "agentmem.sqlite3"
+                            if not manifest.exists() or not existing_db.exists():
+                                raise FileExistsError(f"Refusing to overwrite existing project knowledge directory: {memory}")
+                            meta = json.loads(manifest.read_text(encoding="utf-8"))
+                            if meta.get("project_id") != project_id or Path(meta.get("source_root", "")).resolve() != source_root:
+                                raise ValueError(f"Existing AgentMem directory belongs to a different project: {memory}")
+                            self._validate_project_database(existing_db, project_id, source_root)
+                            self._validate_migrated_records(snapshot, existing_db, p, project_id, remap_brief)
+                        else:
+                            stage = self.memory_root / f".{project_id}.migration"
+                            if stage.exists():
+                                marker = self._manifest_path(stage)
+                                if not marker.exists() or json.loads(marker.read_text(encoding="utf-8")).get("project_id") != project_id:
+                                    raise FileExistsError(f"Refusing to reuse unknown migration staging directory: {stage}")
+                                self._remove_owned_stage(stage, self.memory_root, project_id)
+                            stage.mkdir()
+                            self._write_project_manifest(stage, project_id, source_root)
+                            if remap_brief:
+                                shutil.copy2(brief, stage / "PROJECT.md")
+                            else:
+                                (stage / "PROJECT.md").write_text(
+                                    f"# {p['name']} project memory\n\n"
+                                    f"Registered scope: {p['description'] or p['name']}\n\n"
+                                    "No AgentMem-curated brief existed in the previous store. This migration did not ingest or copy the source repository. "
+                                    "Use the registered source root for evidence, and update this brief with verified project context.\n", encoding="utf-8")
+                            db_path = stage / "agentmem.sqlite3"
+                            self._create_project_database(db_path)
+                            self._copy_legacy_project(snapshot, db_path, p, project_id,
+                                                      remap_legacy_brief=remap_brief)
+                            self._validate_project_database(db_path, project_id, source_root)
+                            self._validate_migrated_records(snapshot, db_path, p, project_id, remap_brief)
+                            stage.replace(memory)
+                        registry.execute("INSERT INTO projects(id,name,root,description,created_at,memory_root) VALUES(?,?,?,?,?,?)",
+                                         (project_id,p["name"],str(source_root),p["description"],p["created_at"],str(memory)))
+                    registry.commit()
+        except Exception:
+            snapshot.close()
+            raise
+        snapshot.close()
+        self._freeze_legacy(legacy_path)
+
+    def _copy_legacy_project(self, snapshot: sqlite3.Connection, target_path: Path, project: dict[str, Any], project_id: str, remap_legacy_brief: bool = False) -> None:
+        target = sqlite3.connect(target_path)
+        target.row_factory = sqlite3.Row
+        try:
+            target.execute("PRAGMA foreign_keys=ON")
+            target.execute("BEGIN IMMEDIATE")
+            project_copy = dict(project)
+            target.execute("INSERT INTO projects(id,name,root,description,created_at) VALUES(?,?,?,?,?)",
+                           tuple(project_copy[k] for k in ("id","name","root","description","created_at")))
+            specs = {
+                "sources": "project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes",
+                "chunks": "rowid,project_id,relpath,sha256,line_start,line_end,body",
+                "tasks": "id,project_id,title,goal,priority,status,acceptance,authorized_paths,blocked_reason,checkpoint,owner,lease_token,lease_until,source_revision,created_at,updated_at",
+                "dependencies": "task_id,depends_on",
+                "receipts": "id,task_id,project_id,owner,body,created_at,idempotency_key",
+                "lessons": "id,project_id,title,trigger_text,procedure,evidence,outcome,status,supersedes,updated_at",
+                "lesson_uses": "lesson_id,receipt_id,outcome,created_at",
+            }
+            for table, cols in specs.items():
+                rows = snapshot.execute(f"SELECT {cols} FROM {table} WHERE project_id=?", (project_id,)).fetchall() if table not in {"dependencies","lesson_uses"} else []
+                if table == "dependencies":
+                    rows = snapshot.execute("SELECT d.task_id,d.depends_on FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.project_id=?",(project_id,)).fetchall()
+                elif table == "lesson_uses":
+                    rows = snapshot.execute("SELECT u.lesson_id,u.receipt_id,u.outcome,u.created_at FROM lesson_uses u JOIN lessons l ON l.id=u.lesson_id WHERE l.project_id=?",(project_id,)).fetchall()
+                if remap_legacy_brief and table in {"sources", "chunks"}:
+                    rel_index = 2 if table == "chunks" else 1
+                    rows = [tuple("@memory/PROJECT.md" if i == rel_index and value == ".agentmem/PROJECT.md" else value
+                                  for i, value in enumerate(row)) for row in rows]
+                target_cols = cols.split(",")
+                placeholders = ",".join("?" for _ in target_cols)
+                target.executemany(f"INSERT INTO {table}({cols}) VALUES({placeholders})", [tuple(r) for r in rows])
+            old_rows = snapshot.execute("SELECT relpath,sha256 FROM sources WHERE project_id=? ORDER BY relpath", (project_id,)).fetchall()
+            old_revision = hashlib.sha256("\n".join(f"{r[0]}:{r[1]}" for r in old_rows).encode()).hexdigest()[:16]
+            new_rows = target.execute("SELECT relpath,sha256 FROM sources WHERE project_id=? ORDER BY relpath", (project_id,)).fetchall()
+            new_revision = hashlib.sha256("\n".join(f"{r[0]}:{r[1]}" for r in new_rows).encode()).hexdigest()[:16]
+            if old_revision != new_revision:
+                target.execute("UPDATE tasks SET source_revision=? WHERE project_id=? AND source_revision=?",(new_revision,project_id,old_revision))
+            target.commit()
+        except Exception:
+            target.rollback()
+            raise
+        finally:
+            target.close()
+
+    def _validate_project_database(self, db_path: Path, project_id: str, source_root: Path) -> dict[str, int]:
+        db = sqlite3.connect(db_path)
+        try:
+            integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise RuntimeError(f"Migrated project database failed integrity check: {project_id}: {integrity}")
+            row = db.execute("SELECT id,root FROM projects WHERE id=?", (project_id,)).fetchone()
+            if not row or Path(row[1]).resolve() != source_root:
+                raise RuntimeError(f"Migrated database has the wrong project identity or source root: {project_id}")
+            counts = {}
+            for table in ("sources","chunks","tasks","dependencies","receipts","lessons","lesson_uses"):
+                if table == "dependencies":
+                    n = db.execute("SELECT COUNT(*) FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.project_id=?",(project_id,)).fetchone()[0]
+                elif table == "lesson_uses":
+                    n = db.execute("SELECT COUNT(*) FROM lesson_uses u JOIN lessons l ON l.id=u.lesson_id WHERE l.project_id=?",(project_id,)).fetchone()[0]
+                else:
+                    n = db.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id=?",(project_id,)).fetchone()[0]
+                counts[table] = n
+            return counts
+        finally:
+            db.close()
+
+    def _validate_migrated_records(self, snapshot: sqlite3.Connection, target_path: Path,
+                                   project: dict[str, Any], project_id: str, remap_brief: bool) -> None:
+        """Check copied project rows and citations against the WAL-consistent legacy snapshot."""
+        target = sqlite3.connect(target_path)
+        try:
+            def expected(table: str):
+                if table == "projects":
+                    return [tuple(project[k] for k in ("id","name","root","description","created_at"))]
+                if table == "sources":
+                    rows = snapshot.execute("SELECT project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes FROM sources WHERE project_id=? ORDER BY relpath",(project_id,)).fetchall()
+                    return [tuple(("@memory/PROJECT.md" if remap_brief and row[1]==".agentmem/PROJECT.md" else row[1]) if i==1 else row[i] for i in range(6)) for row in rows]
+                if table == "chunks":
+                    rows = snapshot.execute("SELECT rowid,project_id,relpath,sha256,line_start,line_end,body FROM chunks WHERE project_id=? ORDER BY rowid",(project_id,)).fetchall()
+                    return [tuple(("@memory/PROJECT.md" if remap_brief and row[2]==".agentmem/PROJECT.md" else row[2]) if i==2 else row[i] for i in range(7)) for row in rows]
+                if table == "tasks":
+                    rows = snapshot.execute("SELECT id,project_id,title,goal,priority,status,acceptance,authorized_paths,blocked_reason,checkpoint,owner,lease_token,lease_until,source_revision,created_at,updated_at FROM tasks WHERE project_id=? ORDER BY id",(project_id,)).fetchall()
+                    old_sources=snapshot.execute("SELECT relpath,sha256 FROM sources WHERE project_id=? ORDER BY relpath",(project_id,)).fetchall()
+                    old_revision=hashlib.sha256("\n".join(f"{r[0]}:{r[1]}" for r in old_sources).encode()).hexdigest()[:16]
+                    new_sources=[(("@memory/PROJECT.md" if remap_brief and r[0]==".agentmem/PROJECT.md" else r[0]),r[1]) for r in old_sources]
+                    new_revision=hashlib.sha256("\n".join(f"{r[0]}:{r[1]}" for r in new_sources).encode()).hexdigest()[:16]
+                    return [tuple(new_revision if i==13 and row[13]==old_revision else row[i] for i in range(16)) for row in rows]
+                if table == "dependencies":
+                    return [tuple(r) for r in snapshot.execute("SELECT d.task_id,d.depends_on FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.project_id=? ORDER BY d.task_id,d.depends_on",(project_id,)).fetchall()]
+                if table == "receipts":
+                    return [tuple(r) for r in snapshot.execute("SELECT id,task_id,project_id,owner,body,created_at,idempotency_key FROM receipts WHERE project_id=? ORDER BY id",(project_id,)).fetchall()]
+                if table == "lessons":
+                    return [tuple(r) for r in snapshot.execute("SELECT id,project_id,title,trigger_text,procedure,evidence,outcome,status,supersedes,updated_at FROM lessons WHERE project_id=? ORDER BY id",(project_id,)).fetchall()]
+                if table == "lesson_uses":
+                    return [tuple(r) for r in snapshot.execute("SELECT u.lesson_id,u.receipt_id,u.outcome,u.created_at FROM lesson_uses u JOIN lessons l ON l.id=u.lesson_id WHERE l.project_id=? ORDER BY u.lesson_id,u.receipt_id",(project_id,)).fetchall()]
+                raise AssertionError(table)
+            queries = {
+                "projects":"SELECT id,name,root,description,created_at FROM projects WHERE id=?",
+                "sources":"SELECT project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes FROM sources WHERE project_id=? ORDER BY relpath",
+                "chunks":"SELECT rowid,project_id,relpath,sha256,line_start,line_end,body FROM chunks WHERE project_id=? ORDER BY rowid",
+                "tasks":"SELECT id,project_id,title,goal,priority,status,acceptance,authorized_paths,blocked_reason,checkpoint,owner,lease_token,lease_until,source_revision,created_at,updated_at FROM tasks WHERE project_id=? ORDER BY id",
+                "dependencies":"SELECT d.task_id,d.depends_on FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.project_id=? ORDER BY d.task_id,d.depends_on",
+                "receipts":"SELECT id,task_id,project_id,owner,body,created_at,idempotency_key FROM receipts WHERE project_id=? ORDER BY id",
+                "lessons":"SELECT id,project_id,title,trigger_text,procedure,evidence,outcome,status,supersedes,updated_at FROM lessons WHERE project_id=? ORDER BY id",
+                "lesson_uses":"SELECT u.lesson_id,u.receipt_id,u.outcome,u.created_at FROM lesson_uses u JOIN lessons l ON l.id=u.lesson_id WHERE l.project_id=? ORDER BY u.lesson_id,u.receipt_id",
+            }
+            for table, query in queries.items():
+                if table == "projects":
+                    actual = [tuple(target.execute(query,(project_id,)).fetchone() or ())]
+                else:
+                    actual = [tuple(row) for row in target.execute(query,(project_id,)).fetchall()]
+                if actual != expected(table):
+                    raise RuntimeError(f"Migration data verification failed for project {project_id!r}, table {table}")
+        finally:
+            target.close()
+
+    def _freeze_legacy(self, legacy_path: Path) -> None:
+        db = sqlite3.connect(legacy_path, timeout=15)
+        try:
+            tables = ("projects","sources","tasks","dependencies","receipts","lessons","lesson_uses")
+            db.execute("BEGIN IMMEDIATE")
+            for table in tables:
+                for action, event in (("insert","INSERT"),("update","UPDATE"),("delete","DELETE")):
+                    name = f"agentmem_retired_{table}_{action}"
+                    db.execute(f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {event} ON {table} BEGIN SELECT RAISE(ABORT,'AgentMem data migrated; restart the MCP server'); END")
+            db.commit()
+        except sqlite3.Error:
+            db.rollback()
+            # The verified backup remains authoritative if this legacy guard cannot be installed.
+        finally:
+            db.close()
+
+    def register_project(self, project_id: str, root: str | Path, description: str = "", memory_root: str | Path | None = None) -> dict[str, Any]:
         project_id = self._valid_id(project_id)
         root_path = Path(root).expanduser().resolve(strict=True)
         if not root_path.is_dir():
             raise ValueError("Project root must be a directory")
+        memory_path = self._safe_memory_path(project_id, root_path, memory_root)
         now = time.time()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
             if existing:
                 if Path(existing["root"]).resolve() != root_path:
                     raise ValueError(f"Project ID {project_id!r} is already bound to another root")
+                if Path(existing["memory_root"]).resolve() != memory_path:
+                    raise ValueError(f"Project ID {project_id!r} is already bound to another knowledge directory")
                 db.execute("UPDATE projects SET description=? WHERE id=?", (description, project_id))
+                db.commit()
             else:
-                db.execute("INSERT INTO projects(id,name,root,description,created_at) VALUES(?,?,?,?,?)",
-                           (project_id, root_path.name or project_id, str(root_path), description, now))
+                if memory_path.exists():
+                    raise FileExistsError(f"Project knowledge directory already exists; it will not be adopted or overwritten: {memory_path}")
+                memory_path.parent.mkdir(parents=True, exist_ok=True)
+                stage = memory_path.parent / f".{project_id}.{uuid.uuid4().hex}.tmp"
+                stage.mkdir()
+                try:
+                    self._write_project_manifest(stage, project_id, root_path)
+                    (stage / "PROJECT.md").write_text(
+                        f"# {root_path.name} project memory\n\nRegistered project ID: `{project_id}`\n\n"
+                        f"{description.strip()}\n\n"
+                        "No repository content has been copied into this directory. Add verified project intent, decisions, current status, and links here.\n", encoding="utf-8")
+                    self._create_project_database(stage / "agentmem.sqlite3")
+                    project_db = sqlite3.connect(stage / "agentmem.sqlite3")
+                    project_db.execute("INSERT INTO projects(id,name,root,description,created_at) VALUES(?,?,?,?,?)",
+                                       (project_id, root_path.name or project_id, str(root_path), description, now))
+                    project_db.commit()
+                    project_db.close()
+                    stage.replace(memory_path)
+                    db.execute("INSERT INTO projects(id,name,root,description,created_at,memory_root) VALUES(?,?,?,?,?,?)",
+                               (project_id, root_path.name or project_id, str(root_path), description, now, str(memory_path)))
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    if stage.exists() and self._manifest_path(stage).exists():
+                        self._remove_owned_stage(stage, memory_path.parent, project_id)
+                    raise
         return self.get_project(project_id)
 
     def _valid_id(self, value: str) -> str:
@@ -154,6 +493,8 @@ class MemoryStore:
             if any(part.lower() in EXCLUDED_DIRS or part.lower().endswith(".egg-info") for part in path.relative_to(root).parts[:-1]):
                 return False
             name = path.name.lower()
+            if name == ".agentmem-project.json":
+                return False
             if name in SENSITIVE_BASENAMES or SECRET_NAME.search(name) or path.suffix.lower() in SECRET_SUFFIXES:
                 return False
             if path.suffix.lower() not in TEXT_SUFFIXES or resolved.stat().st_size > MAX_FILE_BYTES:
@@ -162,52 +503,62 @@ class MemoryStore:
         except (OSError, ValueError):
             return False
 
-    def index_project(self, project_id: str, max_files: int = 5000) -> dict[str, Any]:
-        project = self.get_project(project_id)
-        root = Path(project["root"]).resolve(strict=True)
-        if not 1 <= max_files <= 20000:
-            raise ValueError("max_files must be between 1 and 20000")
-        seen: set[str] = set()
-        scanned = changed = skipped = 0
-        now = time.time()
-        with self.connect() as db:
+    def _source_roots(self, project: dict[str, Any]) -> list[tuple[Path, str]]:
+        # Curated per-project knowledge is first so it survives a bounded scan of a very large source repository.
+        return [(Path(project["memory_root"]).resolve(strict=True), "@memory/"),
+                (Path(project["root"]).resolve(strict=True), "")]
+
+    def _iter_project_files(self, project: dict[str, Any]):
+        for root, prefix in self._source_roots(project):
             for parent, dirs, files in os.walk(root, followlinks=False):
                 dirs[:] = sorted(d for d in dirs if d.lower() not in EXCLUDED_DIRS and not d.lower().endswith(".egg-info")
                                  and not (Path(parent)/d).is_symlink()
                                  and not getattr((Path(parent)/d),"is_junction",lambda:False)())
                 for filename in sorted(files):
                     path = Path(parent) / filename
-                    rel = path.relative_to(root).as_posix()
-                    if not self._safe_file(root, path):
-                        skipped += 1
-                        continue
-                    scanned += 1
-                    if scanned > max_files:
-                        break
-                    try:
-                        stat=path.stat()
-                        text = path.read_text(encoding="utf-8")
-                    except (UnicodeError, OSError):
-                        skipped += 1
-                        continue
-                    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                    seen.add(rel)
-                    prev = db.execute("SELECT sha256 FROM sources WHERE project_id=? AND relpath=?", (project_id, rel)).fetchone()
-                    if prev and prev["sha256"] == digest:
-                        db.execute("UPDATE sources SET indexed_at=?,mtime_ns=?,size_bytes=? WHERE project_id=? AND relpath=?",(now,stat.st_mtime_ns,stat.st_size,project_id,rel))
-                        continue
-                    db.execute("DELETE FROM chunks WHERE project_id=? AND relpath=?", (project_id, rel))
-                    db.execute("INSERT INTO sources(project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,relpath) DO UPDATE SET sha256=excluded.sha256,indexed_at=excluded.indexed_at,mtime_ns=excluded.mtime_ns,size_bytes=excluded.size_bytes",
-                               (project_id, rel, digest, now, stat.st_mtime_ns, stat.st_size))
-                    lines = text.splitlines()
-                    for start in range(0, len(lines), 35):
-                        body = "\n".join(lines[start:start+35]).strip()
-                        if body:
-                            db.execute("INSERT INTO chunks(project_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?)",
-                                       (project_id, rel, digest, start+1, min(start+35, len(lines)), body))
-                    changed += 1
+                    if self._safe_file(root, path):
+                        rel = prefix + path.relative_to(root).as_posix()
+                        yield root, rel, path
+
+    def _source_path(self, project: dict[str, Any], relpath: str) -> Path:
+        if relpath.startswith("@memory/"):
+            return Path(project["memory_root"]) / Path(relpath[len("@memory/"):])
+        return Path(project["root"]) / Path(relpath)
+
+    def index_project(self, project_id: str, max_files: int = 5000) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        if not 1 <= max_files <= 20000:
+            raise ValueError("max_files must be between 1 and 20000")
+        seen: set[str] = set()
+        scanned = changed = skipped = 0
+        now = time.time()
+        with self.connect(project_id) as db:
+            for _, rel, path in self._iter_project_files(project):
+                scanned += 1
                 if scanned > max_files:
                     break
+                try:
+                    stat=path.stat()
+                    text = path.read_text(encoding="utf-8")
+                except (UnicodeError, OSError):
+                    skipped += 1
+                    continue
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                seen.add(rel)
+                prev = db.execute("SELECT sha256 FROM sources WHERE project_id=? AND relpath=?", (project_id, rel)).fetchone()
+                if prev and prev["sha256"] == digest:
+                    db.execute("UPDATE sources SET indexed_at=?,mtime_ns=?,size_bytes=? WHERE project_id=? AND relpath=?",(now,stat.st_mtime_ns,stat.st_size,project_id,rel))
+                    continue
+                db.execute("DELETE FROM chunks WHERE project_id=? AND relpath=?", (project_id, rel))
+                db.execute("INSERT INTO sources(project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,relpath) DO UPDATE SET sha256=excluded.sha256,indexed_at=excluded.indexed_at,mtime_ns=excluded.mtime_ns,size_bytes=excluded.size_bytes",
+                           (project_id, rel, digest, now, stat.st_mtime_ns, stat.st_size))
+                lines = text.splitlines()
+                for start in range(0, len(lines), 35):
+                    body = "\n".join(lines[start:start+35]).strip()
+                    if body:
+                        db.execute("INSERT INTO chunks(project_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?)",
+                                   (project_id, rel, digest, start+1, min(start+35, len(lines)), body))
+                changed += 1
             current = db.execute("SELECT relpath FROM sources WHERE project_id=?", (project_id,)).fetchall()
             # Never interpret a deliberately truncated scan as deleted source.
             removed = [] if scanned > max_files else [r["relpath"] for r in current if r["relpath"] not in seen]
@@ -222,22 +573,15 @@ class MemoryStore:
         """Compare paths, size, and mtime to the index without reading file contents."""
         project=self.get_project(project_id)
         if not 1 <= max_files <= 20000: raise ValueError("max_files must be between 1 and 20000")
-        root=Path(project["root"]).resolve(strict=True)
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             previous={r["relpath"]:dict(r) for r in db.execute("SELECT relpath,mtime_ns,size_bytes FROM sources WHERE project_id=?",(project_id,))}
         seen=set(); changed=[]; added=[]; scanned=0; truncated=False
-        for parent,dirs,files in os.walk(root,followlinks=False):
-            dirs[:]=sorted(d for d in dirs if d.lower() not in EXCLUDED_DIRS and not d.lower().endswith(".egg-info") and not (Path(parent)/d).is_symlink() and not getattr((Path(parent)/d),"is_junction",lambda:False)())
-            for name in sorted(files):
-                path=Path(parent)/name
-                if not self._safe_file(root,path): continue
-                scanned+=1
-                if scanned>max_files: truncated=True; break
-                rel=path.relative_to(root).as_posix(); seen.add(rel); stat=path.stat()
-                old=previous.get(rel)
-                if not old: added.append(rel)
-                elif old["mtime_ns"]!=stat.st_mtime_ns or old["size_bytes"]!=stat.st_size: changed.append(rel)
-            if truncated: break
+        for _,rel,path in self._iter_project_files(project):
+            scanned+=1
+            if scanned>max_files: truncated=True; break
+            seen.add(rel); stat=path.stat(); old=previous.get(rel)
+            if not old: added.append(rel)
+            elif old["mtime_ns"]!=stat.st_mtime_ns or old["size_bytes"]!=stat.st_size: changed.append(rel)
         removed=[] if truncated else sorted(set(previous)-seen)
         return {"project_id":project_id,"changed_paths":changed[:30],"new_paths":added[:30],
                 "deleted_paths":removed[:30],"changed_count":len(changed),"new_count":len(added),
@@ -246,7 +590,7 @@ class MemoryStore:
                 "source_revision":self.source_revision(project_id)}
 
     def source_revision(self, project_id: str) -> str:
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             rows = db.execute("SELECT relpath,sha256 FROM sources WHERE project_id=? ORDER BY relpath", (project_id,)).fetchall()
         digest = hashlib.sha256("\n".join(f"{r['relpath']}:{r['sha256']}" for r in rows).encode()).hexdigest()[:16]
         return digest
@@ -275,7 +619,7 @@ class MemoryStore:
             return {"project_id": project_id, "query": query, "results": [], "gap": "No searchable terms found."}
         # Quote each token so punctuation and FTS operators from the user's query cannot alter syntax.
         fts_query = " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens[:20])
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             rows = db.execute("""SELECT relpath,sha256,line_start,line_end,substr(body,1,2400) AS excerpt,bm25(chunks) AS score
               FROM chunks WHERE project_id=? AND chunks MATCH ? ORDER BY score LIMIT ?""", (project_id, fts_query, limit)).fetchall()
             # FTS5's unicode tokenizer treats a contiguous CJK run as one token. Fall back
@@ -309,15 +653,15 @@ class MemoryStore:
         project = self.get_project(project_id)
         max_chars = min(max(max_chars, 1000), 12000)
         change_summary=self.check_project_changes(project_id)
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             tasks = db.execute("SELECT * FROM tasks WHERE project_id=? AND status IN ('open','in_progress') ORDER BY CASE status WHEN 'in_progress' THEN 0 ELSE 1 END,priority,created_at LIMIT 8", (project_id,)).fetchall()
             accepted = db.execute("SELECT id,title,trigger_text,procedure,evidence,updated_at FROM lessons WHERE project_id=? AND status='accepted' ORDER BY updated_at DESC LIMIT 8", (project_id,)).fetchall()
             source_count = db.execute("SELECT count(*) FROM sources WHERE project_id=?", (project_id,)).fetchone()[0]
             src = db.execute("SELECT relpath,sha256,indexed_at FROM sources WHERE project_id=? ORDER BY relpath LIMIT 100", (project_id,)).fetchall() if include_sources else []
-        brief_path = Path(project["root"]) / ".agentmem" / "PROJECT.md"
-        brief = brief_path.read_text(encoding="utf-8")[:max_chars] if brief_path.exists() else "No curated .agentmem/PROJECT.md brief yet. Ask questions against indexed source evidence; create a project brief after verifying key facts."
+        brief_path = self._project_brief_path(project)
+        brief = brief_path.read_text(encoding="utf-8")[:max_chars] if brief_path.exists() else "No curated project brief yet. Ask questions against indexed source evidence; create a brief after verifying key facts."
         task_list = []
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             for t in tasks:
                 row = dict(t)
                 row.pop("lease_token",None)
@@ -326,7 +670,7 @@ class MemoryStore:
                 row["authorized_paths"] = json.loads(row["authorized_paths"])
                 row["ready"] = row["status"] == "open" and not row["blocked_reason"] and not db.execute("SELECT 1 FROM dependencies d JOIN tasks p ON p.id=d.depends_on WHERE d.task_id=? AND p.status<>'done'", (row["id"],)).fetchone()
                 task_list.append(row)
-        card = {"project": {k: project[k] for k in ("id", "name", "root", "description")},
+        card = {"project": {k: project[k] for k in ("id", "name", "root", "memory_root", "description")},
                 "manager_brief": brief, "tasks": task_list,
                 "accepted_lessons": [dict(x) | {"evidence": json.loads(x["evidence"])} for x in accepted],
                 "indexed_sources": [{"path":x["relpath"],"sha256":x["sha256"],"indexed_at":x["indexed_at"]} for x in src],
@@ -378,7 +722,7 @@ class MemoryStore:
         safe_paths=self._validate_authorized_paths(project_id,authorized_paths)
         task_id, now = uuid.uuid4().hex[:12], time.time()
         deps = list(dict.fromkeys(depends_on or []))
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             for parent in deps:
                 p = db.execute("SELECT project_id FROM tasks WHERE id=?", (parent,)).fetchone()
@@ -399,7 +743,7 @@ class MemoryStore:
         if goal is not None and not goal.strip(): raise ValueError("goal cannot be empty")
         safe_paths=self._validate_authorized_paths(project_id,authorized_paths) if authorized_paths is not None else None
         now=time.time()
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(task_id,project_id)).fetchone()
             if not row: raise ValueError("Task not found in this project")
@@ -429,7 +773,7 @@ class MemoryStore:
     def list_tasks(self, project_id: str, status: str = "all") -> list[dict[str, Any]]:
         self.get_project(project_id)
         if status not in {"all","open","in_progress","done","cancelled"}: raise ValueError("invalid task status")
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             rows=db.execute("SELECT * FROM tasks WHERE project_id=? AND (?='all' OR status=?) ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,priority,created_at",(project_id,status,status)).fetchall()
             out=[]
             for row in rows:
@@ -486,7 +830,7 @@ class MemoryStore:
         if not owner.strip(): raise ValueError("owner is required")
         if not 60 <= lease_seconds <= 86400: raise ValueError("lease_seconds must be between 60 and 86400")
         now=time.time(); token=uuid.uuid4().hex
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(task_id,project_id)).fetchone()
             if not row: raise ValueError("Task not found in this project")
@@ -504,7 +848,7 @@ class MemoryStore:
         return {"task":self.get_task(project_id,task_id),"lease_token":token}
 
     def update_checkpoint(self, project_id: str, task_id: str, owner: str, lease_token: str, checkpoint: dict[str, Any]) -> dict[str, Any]:
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(task_id,project_id)).fetchone()
             if not row: raise ValueError("Task not found in this project")
@@ -514,7 +858,7 @@ class MemoryStore:
         return self.get_task(project_id,task_id)
 
     def set_blocker(self, project_id: str, task_id: str, owner: str, lease_token: str, reason: str) -> dict[str, Any]:
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(task_id,project_id)).fetchone()
             if not row: raise ValueError("Task not found in this project")
@@ -529,7 +873,7 @@ class MemoryStore:
         checks=receipt.get("acceptance_checks",[])
         all_met=bool(checks) and all(bool(c.get("evidence")) and c.get("met") is True for c in checks)
         requested_done=receipt.get("status")=="done"
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(task_id,project_id)).fetchone()
             if not row: raise ValueError("Task not found in this project")
@@ -552,7 +896,7 @@ class MemoryStore:
                 "note":"Done requires every acceptance check to include met=true and evidence." if requested_done and not all_met else ""}
 
     def release_task(self, project_id: str, task_id: str, owner: str, lease_token: str) -> dict[str, Any]:
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(task_id,project_id)).fetchone()
             if not row: raise ValueError("Task not found")
@@ -567,12 +911,12 @@ class MemoryStore:
             self.get_task(project_id,source_task_id)
             evidence=(evidence or [])+[f"task:{source_task_id}"]
         lesson_id=uuid.uuid4().hex[:12]
-        with self.connect() as db: db.execute("INSERT INTO lessons(id,project_id,title,trigger_text,procedure,evidence,outcome,status,updated_at) VALUES(?,?,?,?,?,?,?,'candidate',?)",(lesson_id,project_id,title.strip(),trigger_text.strip(),procedure.strip(),_json(evidence or []),outcome,time.time()))
+        with self.connect(project_id) as db: db.execute("INSERT INTO lessons(id,project_id,title,trigger_text,procedure,evidence,outcome,status,updated_at) VALUES(?,?,?,?,?,?,?,'candidate',?)",(lesson_id,project_id,title.strip(),trigger_text.strip(),procedure.strip(),_json(evidence or []),outcome,time.time()))
         return self.get_lesson(project_id,lesson_id)
 
     def review_lesson(self, project_id: str, lesson_id: str, status: str, supersedes: str = "") -> dict[str, Any]:
         if status not in {"accepted","rejected","superseded"}: raise ValueError("status must be accepted, rejected, or superseded")
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             row=db.execute("SELECT project_id FROM lessons WHERE id=?",(lesson_id,)).fetchone()
             if not row or row["project_id"]!=project_id: raise ValueError("Lesson not found in this project")
             if supersedes:
@@ -582,14 +926,14 @@ class MemoryStore:
         return self.get_lesson(project_id,lesson_id)
 
     def get_lesson(self, project_id: str, lesson_id: str) -> dict[str, Any]:
-        with self.connect() as db: row=db.execute("SELECT * FROM lessons WHERE id=? AND project_id=?",(lesson_id,project_id)).fetchone()
+        with self.connect(project_id) as db: row=db.execute("SELECT * FROM lessons WHERE id=? AND project_id=?",(lesson_id,project_id)).fetchone()
         if not row: raise ValueError("Lesson not found in this project")
         out=dict(row); out["evidence"]=json.loads(out["evidence"]); return out
 
     def search_lessons(self, project_id: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
         self.get_project(project_id)
         tokens={x.lower() for x in re.findall(r"[\w\u0080-\uffff]+",query)}
-        with self.connect() as db: rows=db.execute("SELECT * FROM lessons WHERE project_id=? AND status='accepted'",(project_id,)).fetchall()
+        with self.connect(project_id) as db: rows=db.execute("SELECT * FROM lessons WHERE project_id=? AND status='accepted'",(project_id,)).fetchall()
         def score(row: sqlite3.Row) -> int:
             hay=(row["title"]+" "+row["trigger_text"]+" "+row["procedure"]).lower()
             return sum(1 for t in tokens if t in hay)
@@ -598,7 +942,7 @@ class MemoryStore:
 
     def export_project(self, project_id: str) -> dict[str, Any]:
         project=self.get_project(project_id)
-        with self.connect() as db:
+        with self.connect(project_id) as db:
             tasks=[dict(x) for x in db.execute("SELECT * FROM tasks WHERE project_id=?",(project_id,))]
             for task in tasks: task.pop("lease_token",None)
             lessons=[dict(x) for x in db.execute("SELECT * FROM lessons WHERE project_id=?",(project_id,))]
@@ -606,3 +950,28 @@ class MemoryStore:
             lesson_uses=[dict(x) for x in db.execute("SELECT u.* FROM lesson_uses u JOIN lessons l ON l.id=u.lesson_id WHERE l.project_id=?",(project_id,))]
             deps=[dict(x) for x in db.execute("SELECT d.* FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.project_id=?",(project_id,))]
         return {"schema_version":1,"exported_at":time.time(),"project":project,"tasks":tasks,"dependencies":deps,"receipts":receipts,"lessons":lessons,"lesson_uses":lesson_uses}
+
+    def update_project_brief(self, project_id: str, markdown: str) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        if len(markdown) > 24000:
+            raise ValueError("brief must be 24000 characters or fewer")
+        raw_root = Path(project["memory_root"])
+        if raw_root.is_symlink() or getattr(raw_root,"is_junction",lambda:False)():
+            raise ValueError("Project knowledge directory cannot be a symlink or junction")
+        root = raw_root.resolve(strict=True)
+        if root != raw_root.absolute():
+            raise ValueError("Project knowledge directory changed from its registered location")
+        manifest = self._manifest_path(root)
+        if not manifest.is_file():
+            raise ValueError("Project knowledge directory is missing its AgentMem manifest")
+        meta = json.loads(manifest.read_text(encoding="utf-8"))
+        if meta.get("project_id") != project_id:
+            raise ValueError("Project knowledge directory belongs to a different project")
+        destination = root / "PROJECT.md"
+        if destination.is_symlink() or getattr(destination,"is_junction",lambda:False)():
+            raise ValueError("Project brief cannot be a symlink or junction")
+        temp = root / f".PROJECT.{uuid.uuid4().hex}.tmp"
+        with temp.open("x", encoding="utf-8") as stream:
+            stream.write(markdown)
+        temp.replace(destination)
+        return {"project_id":project_id,"path":str(destination),"characters":len(markdown)}

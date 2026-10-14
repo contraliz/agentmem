@@ -14,6 +14,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
     root=Path(__file__).resolve().parents[1]
     project=tmp_path/"pilot"; project.mkdir(); (project/"README.md").write_text("The maximum retry limit is four attempts.\n",encoding="utf-8")
     env=os.environ.copy(); env["AGENTMEM_DATA_DIR"]=str(tmp_path/"mcp-state")
+    env["AGENTMEM_MEMORY_ROOT"]=str(tmp_path/"project-kbs")
     env.pop("PYTHONPATH",None)
     params=StdioServerParameters(command=sys.executable,args=["-m","agentmem.server"],env=env,cwd=tmp_path)
 
@@ -25,6 +26,9 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert all(not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",tool.description or "",re.I) for tool in tools.tools)
             result=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
             assert result.structured_content["id"]=="pilot"
+            brief=await client.call_tool("update_project_brief",{"project_id":"pilot","markdown":"# Pilot memory\nThis brief is stored outside the source repository.\n"})
+            assert brief.structured_content["path"]==str(tmp_path/"project-kbs"/"pilot"/"PROJECT.md")
+            assert not (project/".agentmem"/"PROJECT.md").exists()
             indexed=await client.call_tool("index_project",{"project_id":"pilot","max_files":100})
             assert indexed.structured_content["project_id"]=="pilot"
             status=await client.call_tool("check_project_changes",{"project_id":"pilot"})
@@ -35,7 +39,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert attached.structured_content["project"]["id"]=="pilot"
             assert len(str(attached.structured_content))<6500
             assert attached.structured_content["indexed_sources"]==[]
-            assert attached.structured_content["indexed_source_count"]==1
+            assert attached.structured_content["indexed_source_count"]==2
             assert not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",str(attached.structured_content),re.I)
             started=time.perf_counter()
             query=await client.call_tool("retrieve_evidence",{"project_id":"pilot","query":"MCP server"})
@@ -50,7 +54,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert combined_evidence["results"][0]["citation"].startswith("README.md#L1-")
             assert combined_evidence["results"][0]["fresh"] is True
             manifest=await client.call_tool("attach_project",{"project_id":"pilot","include_sources":True})
-            assert manifest.structured_content["indexed_sources"][0]["path"]=="README.md"
+            assert {item["path"] for item in manifest.structured_content["indexed_sources"]}=={"README.md","@memory/PROJECT.md"}
             other=tmp_path/"other"; other.mkdir(); (other/"README.md").write_text("completely unrelated notes",encoding="utf-8")
             await client.call_tool("projects",{"action":"register","project_id":"other","root":str(other)})
             await client.call_tool("index_project",{"project_id":"other"})

@@ -4,9 +4,9 @@ Agent Memory is a local, project-scoped context and work-tracking module for Cod
 
 ## Ready to use here
 
-This workspace is installed in a local Python environment and registered in Codex as the stdio MCP server `agentmem`. The database is at `[local path redacted]\.agentmem-data\agentmem.sqlite3`; indexed files stay in the registered project root and task/lesson state stays in that database. Open a new Codex chat/session if the current one does not yet show the new tools.
+This workspace is installed in a local Python environment and registered in Codex as the stdio MCP server `agentmem`. The small locator registry and migration backups stay in `[local path redacted]\.agentmem-data`; each project's active SQLite store and `PROJECT.md` live in its own knowledge directory under `D:\projects`.
 
-The Agent Memory workspace is the pilot project, registered as `agentmem`. Its brief lives at `.agentmem/PROJECT.md` and the current source index covers this workspace. Data is local; no API key is needed.
+The Agent Memory project uses `[local path redacted]` and keeps the original source root at `[local path redacted]`. <redacted-private-value> uses `[local path redacted]` and keeps its source root at `[local path redacted]`. The <redacted-private-value> move preserved only its preexisting AgentMem records; no source repository or vault content was copied or indexed. The old shared database was backed up and marked retired. Open a fresh Codex chat/session to make sure it launches the updated server. Data is local; no API key is needed.
 
 ## First setup on this PC or another checkout
 
@@ -28,9 +28,17 @@ To register another project, use this workspace's stable CLI wrapper from any di
 & '[local path redacted]\agentmem.ps1' attach sunflower
 ```
 
-Merge [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) into that project's existing `AGENTS.md`, replacing `<PROJECT_ID>` with its registered ID; create `AGENTS.md` only if the project has none. This makes Codex's workflow explicit without replacing existing project instructions. Registering a root never gives the MCP permission to edit arbitrary files: curated project text is written only to that project's `.agentmem/PROJECT.md` through `update_project_brief`.
+The default KB will be `D:\projects\sunflower`; pass `--memory-root '<local-path>'` after `register` for a custom location. A project ID cannot be silently rebound to another source root or memory directory.
 
-Data location can be overridden by setting `AGENTMEM_DATA_DIR` in the MCP environment. The configuration installed here points it at the ignored workspace `.agentmem-data` folder. To inspect the exact registered process without revealing unrelated settings, run `codex mcp get agentmem`.
+Merge [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) into that project's existing `AGENTS.md`, replacing `<PROJECT_ID>` with its registered ID; create `AGENTS.md` only if the project has none. This makes Codex's workflow explicit without replacing existing project instructions. `update_project_brief` writes only to the AgentMem-owned `PROJECT.md` inside that project's registered knowledge directory; original source repositories are read for evidence and are never used as the KB storage location.
+
+`AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it defaults to `D:\projects` on Windows. `--data-dir` and `--memory-root` are also available in the CLI. The current Codex server environment points at the ignored workspace `.agentmem-data` registry. To inspect its command without revealing unrelated settings, run `codex mcp get agentmem`.
+
+## Storage layout and migration
+
+`D:\projects\<project_id>\agentmem.sqlite3` is authoritative for that project's tasks, dependencies, claims/checkpoints, receipts, lessons, source hashes, and FTS evidence index. `D:\projects\<project_id>\PROJECT.md` is the curated human-readable brief. `D:\projects\<project_id>\.agentmem-project.json` identifies the KB and source root. The app registry contains only project ID, source root, description, and KB path so it can route requests. Source files stay in their original repositories; the index stores cited text excerpts and hashes, not copies of those repositories.
+
+On first startup after the upgrade, AgentMem makes a WAL-consistent backup of the former shared database under `.agentmem-data\migration-backups`, copies and verifies every registered project's records into separate stores, then switches the locator registry. It retains the old database as a guarded recovery copy. The original `[local path redacted]\.agentmem\PROJECT.md` remains untouched as a pre-migration copy; the authoritative brief is now `[local path redacted]\PROJECT.md`. Restart/open a new Codex session after the first migration so an older running MCP process does not keep addressing the retired store. For a custom KB location, set `AGENTMEM_MEMORY_ROOT` consistently for both MCP and CLI processes.
 
 ## Use it in Codex
 
