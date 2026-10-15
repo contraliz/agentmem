@@ -87,11 +87,11 @@ def test_attach_can_bundle_focused_cited_question_evidence(setup):
     assert evidence["results"][0]["excerpt_truncated"] is True
     plain=store.attach("p")
     assert "question_context" not in plain
-    assert plain["indexed_sources"]==[] and plain["indexed_source_count"]==9
+    assert plain["indexed_sources"]==[] and plain["indexed_source_count"]==10
     assert plain["source_manifest_included"] is False
     detailed=store.attach("p",include_sources=True)
     assert {item["path"] for item in detailed["indexed_sources"]}=={
-        "guide.md","@memory/PROJECT.md","@memory/requirements.md","@memory/decisions.md",
+        "guide.md","@memory/PROJECT.md","@memory/requirements.md","@memory/decisions.md","@memory/approvals.md",
         *{f"@memory/knowledge/{page_id}.md" for page_id in ("purpose","architecture","risks","history","materials")},
     }
     compact=store.attach("p",max_chars=1000,query="retry limit")
@@ -438,9 +438,9 @@ def test_restart_persistence_and_export(setup):
     restored=MemoryStore(data)
     assert restored.get_task("p",task["id"])["title"]=="persist"
     exported=restored.export_project("p")
-    assert exported["schema_version"]==3 and exported["tasks"]
+    assert exported["schema_version"]==4 and exported["tasks"]
     assert exported["knowledge_manifest"]["page_count"]==5
-    with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==5
+    with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==7
 
 
 def test_task_context_is_bounded_and_reports_indexed_revision_change(setup):

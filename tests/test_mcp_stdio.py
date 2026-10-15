@@ -22,7 +22,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
         async with Client(params,read_timeout_seconds=20) as client:
             tools=await client.list_tools()
             names={tool.name for tool in tools.tools}
-            assert {"projects","attach_project","knowledge","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","export_project"}.issubset(names)
+            assert {"projects","attach_project","knowledge","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","proposals","export_project"}.issubset(names)
             assert all(not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",tool.description or "",re.I) for tool in tools.tools)
             result=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
             assert result.structured_content["id"]=="pilot"
@@ -52,7 +52,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert attached.structured_content["project"]["id"]=="pilot"
             assert len(str(attached.structured_content))<6500
             assert attached.structured_content["indexed_sources"]==[]
-            assert attached.structured_content["indexed_source_count"]==10
+            assert attached.structured_content["indexed_source_count"]==11
             assert attached.structured_content["knowledge_pages"]["count"]==6
             assert "No source files have been indexed yet." not in attached.structured_content["unknowns"]
             assert not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",str(attached.structured_content),re.I)
@@ -70,7 +70,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert combined_evidence["results"][0]["fresh"] is True
             manifest=await client.call_tool("attach_project",{"project_id":"pilot","include_sources":True})
             assert {item["path"] for item in manifest.structured_content["indexed_sources"]}=={
-                "README.md","@memory/PROJECT.md","@memory/requirements.md","@memory/decisions.md",
+                "README.md","@memory/PROJECT.md","@memory/requirements.md","@memory/decisions.md","@memory/approvals.md",
                 *{f"@memory/knowledge/{page_id}.md" for page_id in ("purpose","architecture","risks","history","materials","mcp-notes")},
             }
             other=tmp_path/"other"; other.mkdir(); (other/"README.md").write_text("completely unrelated notes",encoding="utf-8")
@@ -119,8 +119,20 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             current_req=next(item for item in req_packet["applicable_requirements"] if item["id"]==rid)
             req_receipt=await client.call_tool("record_work",{"action":"receipt","project_id":"pilot","task_id":req_task.structured_content["id"],"owner":"mcp-test","lease_token":req_claim.structured_content["lease_token"],"idempotency_key":"mcp-requirement-receipt","receipt":{"status":"done","requirements_revision":req_packet["requirements_revision"],"requirement_checks":[{"requirement_id":rid,"revision":current_req["revision"],"met":True,"evidence":"asserted cited output"}],"acceptance_checks":[{"criterion":"test passes","met":True,"evidence":"MCP end-to-end test passed"}]}})
             assert req_receipt.structured_content["status"]=="done"
+            proposal=await client.call_tool("proposals",{"action":"create","project_id":"pilot","title":"Test proposal","content":"Keep the API stable while changing internals.","targets":[{"kind":"requirement","id":rid,"revision":2}],"approval_required":True,"created_by":"test harness","idempotency_key":"stdio-proposal"})
+            proposal_id=proposal.structured_content["id"]
+            assert proposal.structured_content["approval"]["status"]=="not_recorded"
+            approved=await client.call_tool("proposals",{"action":"approve","project_id":"pilot","proposal_id":proposal_id,"expected_revision":1,"original_quote":"Test fixture: approve this exact snapshot.","source_type":"test_fixture","source_ref":"stdio integration test","source_date":"unknown","recorded_by":"test harness","idempotency_key":"stdio-approval"})
+            assert approved.structured_content["decision"]=="approved"
+            current_approval=await client.call_tool("proposals",{"action":"status","project_id":"pilot","proposal_id":proposal_id})
+            assert current_approval.structured_content["status"]=="approved"
+            gated_task=await client.call_tool("tasks",{"action":"create","project_id":"pilot","title":"Gated rollout","goal":"Execute approved content only","approval_proposal_id":proposal_id})
+            gated_context=await client.call_tool("task_context",{"project_id":"pilot","task_id":gated_task.structured_content["id"]})
+            assert gated_context.structured_content["approval"]["status"]=="approved"
+            assert (await client.call_tool("claim_task",{"project_id":"pilot","task_id":gated_task.structured_content["id"],"owner":"gated-test"})).structured_content["task"]["status"]=="in_progress"
             exports=await client.call_tool("export_project",{"project_id":"pilot"})
-            assert exports.structured_content["schema_version"]==3 and exports.structured_content["requirements"] and exports.structured_content["decisions"]
+            assert exports.structured_content["schema_version"]==4 and exports.structured_content["requirements"] and exports.structured_content["decisions"]
+            assert len(exports.structured_content["proposals"])==1 and len(exports.structured_content["approval_events"])==1
             assert exports.structured_content["knowledge_manifest"]["page_count"]==6
             assert attach_ms<2000 and search_ms<2000
             print(f"stdio probe attach_ms={attach_ms:.1f} search_ms={search_ms:.1f} combined_attach_query_ms={combined_ms:.1f}")

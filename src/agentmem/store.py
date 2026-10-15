@@ -25,6 +25,8 @@ MAX_KNOWLEDGE_PAGE_BYTES = 48_000
 MAX_KNOWLEDGE_OUTPUT_CHARS = 12_000
 KNOWLEDGE_PAGE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 RESERVED_KNOWLEDGE_PAGE_IDS = {"requirements", "decisions", "index", "project"}
+MAX_PROPOSAL_BYTES = 64_000
+MAX_PROPOSAL_TARGETS = 50
 KNOWLEDGE_PAGE_TEMPLATES = {
     "purpose": ("Purpose and scope", "Document verified project goals, users, boundaries, and non-goals.\n\nNot documented yet."),
     "architecture": ("Architecture", "Document the major components, interfaces, data flows, and rationale. Link source files rather than copying large code excerpts.\n\nNot documented yet."),
@@ -110,7 +112,7 @@ class MemoryStore:
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA journal_mode=WAL")
         current_schema = db.execute("PRAGMA user_version").fetchone()[0]
-        if current_schema > 5:
+        if current_schema > 7:
             db.close()
             raise RuntimeError(f"Database schema {current_schema} is newer than this Agent Memory version")
         db.executescript("""
@@ -133,7 +135,7 @@ class MemoryStore:
               checkpoint TEXT NOT NULL DEFAULT '{}', owner TEXT NOT NULL DEFAULT '',
               lease_token TEXT NOT NULL DEFAULT '', lease_until REAL NOT NULL DEFAULT 0,
               source_revision TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
-              components TEXT NOT NULL DEFAULT '[]');
+              components TEXT NOT NULL DEFAULT '[]', approval_proposal_id TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS dependencies(
               task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
               depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -192,7 +194,30 @@ class MemoryStore:
               PRIMARY KEY(task_id,requirement_id));
             CREATE TABLE IF NOT EXISTS project_record_revisions(
               project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-              requirements_revision INTEGER NOT NULL DEFAULT 0, decisions_revision INTEGER NOT NULL DEFAULT 0);
+              requirements_revision INTEGER NOT NULL DEFAULT 0, decisions_revision INTEGER NOT NULL DEFAULT 0,
+              approvals_revision INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS proposals(
+              id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              title TEXT NOT NULL, content TEXT NOT NULL, targets TEXT NOT NULL DEFAULT '[]',
+              approval_required INTEGER NOT NULL DEFAULT 0, source_type TEXT NOT NULL DEFAULT '',
+              source_ref TEXT NOT NULL DEFAULT '', source_date TEXT NOT NULL DEFAULT '',
+              created_by TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 1,
+              content_sha256 TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS proposal_history(
+              id INTEGER PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              proposal_id TEXT NOT NULL, revision INTEGER NOT NULL, snapshot TEXT NOT NULL,
+              action TEXT NOT NULL, change_note TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL,
+              request_hash TEXT NOT NULL, recorded_at REAL NOT NULL,
+              UNIQUE(proposal_id,revision), UNIQUE(project_id,idempotency_key));
+            CREATE TABLE IF NOT EXISTS approval_events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              proposal_id TEXT NOT NULL, proposal_revision INTEGER NOT NULL, proposal_sha256 TEXT NOT NULL,
+              proposal_snapshot TEXT NOT NULL DEFAULT '{}', target_snapshots TEXT NOT NULL, decision TEXT NOT NULL,
+              original_quote TEXT NOT NULL, source_type TEXT NOT NULL, source_ref TEXT NOT NULL,
+              source_date TEXT NOT NULL, recorded_by TEXT NOT NULL, target_event_id TEXT NOT NULL DEFAULT '',
+              idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL, recorded_at REAL NOT NULL,
+              UNIQUE(project_id,idempotency_key));
             CREATE TABLE IF NOT EXISTS knowledge_projections(
               project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
               kind TEXT NOT NULL, content_hash TEXT NOT NULL, rendered_revision INTEGER NOT NULL,
@@ -222,7 +247,27 @@ class MemoryStore:
             if "size_bytes" not in source_columns: db.execute("ALTER TABLE sources ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0")
             task_columns={r[1] for r in db.execute("PRAGMA table_info(tasks)")}
             if "components" not in task_columns: db.execute("ALTER TABLE tasks ADD COLUMN components TEXT NOT NULL DEFAULT '[]'")
-            db.execute("PRAGMA user_version=5")
+            if "approval_proposal_id" not in task_columns: db.execute("ALTER TABLE tasks ADD COLUMN approval_proposal_id TEXT NOT NULL DEFAULT ''")
+            revision_columns={r[1] for r in db.execute("PRAGMA table_info(project_record_revisions)")}
+            if "approvals_revision" not in revision_columns: db.execute("ALTER TABLE project_record_revisions ADD COLUMN approvals_revision INTEGER NOT NULL DEFAULT 0")
+            event_columns={r[1] for r in db.execute("PRAGMA table_info(approval_events)")}
+            if "proposal_snapshot" not in event_columns:
+                db.execute("ALTER TABLE approval_events ADD COLUMN proposal_snapshot TEXT NOT NULL DEFAULT '{}'")
+                # Schema v6 retained every proposal revision; recover the exact
+                # event snapshot only when its canonical content hash matches.
+                # Never substitute the proposal's newer current content.
+                for event in db.execute("SELECT event_id,project_id,proposal_id,proposal_revision,proposal_sha256 FROM approval_events WHERE proposal_snapshot='{}'").fetchall():
+                    history=db.execute("SELECT snapshot FROM proposal_history WHERE project_id=? AND proposal_id=? AND revision=?",
+                                       (event["project_id"],event["proposal_id"],event["proposal_revision"])).fetchone()
+                    if not history: continue
+                    try: snapshot=json.loads(history["snapshot"])
+                    except (TypeError,json.JSONDecodeError): continue
+                    digest=hashlib.sha256(_json({"title":snapshot.get("title",""),"content":snapshot.get("content","")}).encode("utf-8")).hexdigest()
+                    if digest==event["proposal_sha256"]:
+                        db.execute("UPDATE approval_events SET proposal_snapshot=? WHERE event_id=?",(_json(snapshot),event["event_id"]))
+            db.execute("CREATE INDEX IF NOT EXISTS idx_proposals_project_updated ON proposals(project_id,updated_at DESC)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_approval_events_proposal ON approval_events(project_id,proposal_id,id DESC)")
+            db.execute("PRAGMA user_version=7")
             db.commit()
         except Exception:
             db.rollback()
@@ -235,7 +280,26 @@ class MemoryStore:
             version=db.execute("PRAGMA user_version").fetchone()[0]
         finally:
             db.close()
-        if version < 5:
+        if version < 7:
+            if version>0 and db_path.is_file():
+                # Use SQLite's online backup API so committed WAL content is
+                # included before an additive schema migration.
+                backups=self.data_dir/"migration-backups"; backups.mkdir(parents=True,exist_ok=True)
+                backup_path=backups/f"project-schema-v{version}-to-v7-{int(time.time())}-{uuid.uuid4().hex[:8]}.sqlite3"
+                source=sqlite3.connect(db_path,timeout=30)
+                backup=sqlite3.connect(backup_path)
+                try:
+                    source.backup(backup)
+                    result=backup.execute("PRAGMA integrity_check").fetchone()[0]
+                    if result!="ok": raise RuntimeError(f"Project schema backup failed integrity check: {result}")
+                    backup.commit()
+                except Exception:
+                    backup.close(); source.close()
+                    backup_path.unlink(missing_ok=True)
+                    raise
+                finally:
+                    if backup: backup.close()
+                    if source: source.close()
             self._create_project_database(db_path)
 
     def _migrate_registry_if_legacy_rows(self) -> None:
@@ -528,7 +592,7 @@ class MemoryStore:
             "- [Project history](knowledge/history.md)\n"
             "- [Project materials](knowledge/materials.md)\n\n"
             "## Structured records\n\n"
-            "- [Requirements](requirements.md) and [decisions](decisions.md) are generated views of the project's SQLite records.\n"
+            "- [Requirements](requirements.md), [decisions](decisions.md), and [proposal approvals](approvals.md) are generated views of the project's SQLite records.\n"
             "- Current tasks, checkpoints, receipts, and reviewed lessons are retrieved through AgentMem tools.\n\n"
             "No project-specific facts have been verified yet.\n", encoding="utf-8", newline="\n")
 
@@ -578,6 +642,7 @@ class MemoryStore:
         if created:
             self.sync_records_projection(project_id, "requirements")
             self.sync_records_projection(project_id, "decisions")
+            self.sync_records_projection(project_id, "approvals")
         return self.get_project(project_id)
 
     def _valid_id(self, value: str) -> str:
@@ -816,6 +881,12 @@ class MemoryStore:
             current_decision_count=db.execute("SELECT count(*) FROM decisions WHERE project_id=? AND status='current'",(project_id,)).fetchone()[0]
             proposed_req_count=db.execute("SELECT count(*) FROM requirements WHERE project_id=? AND lifecycle='proposed'",(project_id,)).fetchone()[0]
             proposed_decision_count=db.execute("SELECT count(*) FROM decisions WHERE project_id=? AND status='proposed'",(project_id,)).fetchone()[0]
+            approval_required_count=db.execute("SELECT count(*) FROM proposals WHERE project_id=? AND approval_required=1",(project_id,)).fetchone()[0]
+            gated_proposals=db.execute("SELECT id,title,revision FROM proposals WHERE project_id=? AND approval_required=1 ORDER BY updated_at DESC,id LIMIT 4",(project_id,)).fetchall()
+            approval_summaries=[]
+            for p in gated_proposals:
+                state=self._proposal_status(db,p["id"])
+                approval_summaries.append({"proposal_id":p["id"],"title":p["title"],"revision":p["revision"],"status":state["status"]})
         brief_path = self._project_brief_path(project)
         brief = brief_path.read_text(encoding="utf-8")[:max_chars] if brief_path.exists() else "No curated project brief yet. Ask questions against indexed source evidence; create a brief after verifying key facts."
         task_list = []
@@ -839,6 +910,9 @@ class MemoryStore:
                                 "project_wide":invariants[:8],"project_wide_truncated":len(invariants)>8,
                                 "current_decisions":[dict(x) for x in current_decisions],"current_decisions_truncated":current_decision_count>len(current_decisions),
                                 "proposed_decisions":int(proposed_decision_count),"source":"SQLite records; use requirements/decisions for full records and history"},
+                "approvals":{"required_proposal_count":int(approval_required_count),"required_proposals":approval_summaries,
+                             "truncated":approval_required_count>len(approval_summaries),
+                             "note":"Only explicitly approval-required proposals appear here; historical requirements and decisions are not assumed approved."},
                 "accepted_lessons": [dict(x) | {"evidence": json.loads(x["evidence"])} for x in accepted],
                 "indexed_sources": [{"path":x["relpath"],"sha256":x["sha256"],"indexed_at":x["indexed_at"]} for x in src],
                 "indexed_source_count": source_count,
@@ -913,13 +987,15 @@ class MemoryStore:
     def create_task(self, project_id: str, title: str, goal: str, acceptance: list[str] | None = None,
                     priority: int = 3, depends_on: list[str] | None = None,
                     authorized_paths: list[str] | None = None, blocked_reason: str = "",
-                    components: list[str] | None = None, requirement_ids: list[str] | None = None) -> dict[str, Any]:
+                    components: list[str] | None = None, requirement_ids: list[str] | None = None,
+                    approval_proposal_id: str = "") -> dict[str, Any]:
         self.get_project(project_id)
         if not title.strip() or not goal.strip(): raise ValueError("title and goal are required")
         if not 1 <= int(priority) <= 5: raise ValueError("priority must be 1 (highest) to 5")
         safe_paths=self._validate_authorized_paths(project_id,authorized_paths)
         components=list(dict.fromkeys(x.strip() for x in (components or []) if x.strip()))
         requirement_ids=list(dict.fromkeys(requirement_ids or []))
+        approval_proposal_id=approval_proposal_id.strip()
         task_id, now = uuid.uuid4().hex[:12], time.time()
         deps = list(dict.fromkeys(depends_on or []))
         with self.connect(project_id) as db:
@@ -927,8 +1003,10 @@ class MemoryStore:
             for parent in deps:
                 p = db.execute("SELECT project_id FROM tasks WHERE id=?", (parent,)).fetchone()
                 if not p or p["project_id"] != project_id: raise ValueError(f"Dependency {parent!r} is missing or belongs to another project")
-            db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,acceptance,authorized_paths,blocked_reason,created_at,updated_at,source_revision,components) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (task_id,project_id,title.strip(),goal.strip(),int(priority),_json(acceptance or []),_json(safe_paths),blocked_reason.strip(),now,now,self.source_revision(project_id),_json(components)))
+            if approval_proposal_id and not db.execute("SELECT 1 FROM proposals WHERE id=? AND project_id=?",(approval_proposal_id,project_id)).fetchone():
+                raise ValueError("approval_proposal_id must name a proposal in this project")
+            db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,acceptance,authorized_paths,blocked_reason,created_at,updated_at,source_revision,components,approval_proposal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (task_id,project_id,title.strip(),goal.strip(),int(priority),_json(acceptance or []),_json(safe_paths),blocked_reason.strip(),now,now,self.source_revision(project_id),_json(components),approval_proposal_id))
             for rid in requirement_ids:
                 req=db.execute("SELECT revision,lifecycle,criteria FROM requirements WHERE id=? AND project_id=?",(rid,project_id)).fetchone()
                 if not req or req["lifecycle"]!="current": raise ValueError(f"Requirement {rid!r} is missing, non-current, or belongs to another project")
@@ -942,7 +1020,7 @@ class MemoryStore:
                     acceptance: list[str] | None = None, priority: int | None = None,
                     authorized_paths: list[str] | None = None, depends_on: list[str] | None = None,
                     blocked_reason: str | None = None, components: list[str] | None = None,
-                    requirement_ids: list[str] | None = None) -> dict[str, Any]:
+                    requirement_ids: list[str] | None = None, approval_proposal_id: str | None = None) -> dict[str, Any]:
         if priority is not None and not 1 <= int(priority) <= 5: raise ValueError("priority must be 1 (highest) to 5")
         if title is not None and not title.strip(): raise ValueError("title cannot be empty")
         if goal is not None and not goal.strip(): raise ValueError("goal cannot be empty")
@@ -974,8 +1052,11 @@ class MemoryStore:
                     req=db.execute("SELECT revision,lifecycle,criteria FROM requirements WHERE id=? AND project_id=?",(rid,project_id)).fetchone()
                     if not req or req["lifecycle"]!="current": raise ValueError(f"Requirement {rid!r} is missing, non-current, or belongs to another project")
                     db.execute("INSERT INTO task_requirement_links(task_id,requirement_id,requirement_revision,acceptance,linked_at) VALUES(?,?,?,?,?)",(task_id,rid,req["revision"],req["criteria"],now))
-            db.execute("UPDATE tasks SET title=?,goal=?,acceptance=?,priority=?,authorized_paths=?,components=?,blocked_reason=?,updated_at=? WHERE id=?",
-                       (changes["title"],changes["goal"],changes["acceptance"],changes["priority"],changes["authorized_paths"],changes["components"],changes["blocked_reason"],now,task_id))
+            proposal_id=row["approval_proposal_id"] if approval_proposal_id is None else approval_proposal_id.strip()
+            if proposal_id and not db.execute("SELECT 1 FROM proposals WHERE id=? AND project_id=?",(proposal_id,project_id)).fetchone():
+                raise ValueError("approval_proposal_id must name a proposal in this project")
+            db.execute("UPDATE tasks SET title=?,goal=?,acceptance=?,priority=?,authorized_paths=?,components=?,blocked_reason=?,approval_proposal_id=?,updated_at=? WHERE id=?",
+                       (changes["title"],changes["goal"],changes["acceptance"],changes["priority"],changes["authorized_paths"],changes["components"],changes["blocked_reason"],proposal_id,now,task_id))
             db.commit()
         return self.get_task(project_id,task_id)
 
@@ -1008,7 +1089,7 @@ class MemoryStore:
     def task_context(self, project_id: str, task_id: str, max_chars: int = 6000,
                      requirement_offset: int = 0, requirements_limit: int = 8) -> dict[str, Any]:
         raw_task=self.get_task(project_id,task_id)
-        task={k:raw_task[k] for k in ("id","title","goal","priority","status","acceptance","authorized_paths","blocked_reason","checkpoint","dependencies","blocked_by","ready","blocked","source_revision")}
+        task={k:raw_task[k] for k in ("id","title","goal","priority","status","acceptance","authorized_paths","blocked_reason","checkpoint","dependencies","blocked_by","ready","blocked","source_revision","approval_proposal_id")}
         max_chars=min(max(1000,int(max_chars)),12000)
         query=(task["title"]+" "+task["goal"]).strip()
         evidence=self.search(project_id,query,limit=5)
@@ -1016,7 +1097,8 @@ class MemoryStore:
         current_revision=self.source_revision(project_id)
         change_summary=self.check_project_changes(project_id)
         req_context=self._task_requirements(project_id,raw_task,requirement_offset,requirements_limit)
-        packet={"project_id":project_id,"task":task,"requirements":req_context,"applicable_accepted_lessons":lessons,
+        approval_context=self.proposal_status(project_id,task["approval_proposal_id"]) if task["approval_proposal_id"] else None
+        packet={"project_id":project_id,"task":task,"requirements":req_context,"approval":approval_context,"applicable_accepted_lessons":lessons,
                 "evidence":evidence["results"],"evidence_gap":evidence["gap"],
                 "task_source_revision":task["source_revision"],"current_source_revision":current_revision,
                 "indexed_source_revision_changed_since_creation":task["source_revision"]!=current_revision,
@@ -1044,6 +1126,7 @@ class MemoryStore:
         if len(_json(packet))>max_chars:
             packet={"project_id":project_id,"task":{"id":task_id,"title":task["title"][:80],"status":task["status"],"ready":task["ready"]},
                     "requirements":{"requirements_revision":req_context["requirements_revision"],"applicable_count":req_context["applicable_count"],"requirements_complete":False,"next_requirement_offset":requirement_offset,"required_action":"Call task_context with a larger max_chars or next requirement offset; governing requirements were omitted for output budget."},
+                    "approval":approval_context,
                     "task_source_revision":task["source_revision"],"current_source_revision":current_revision,
                     "indexed_source_revision_changed_since_creation":task["source_revision"]!=current_revision,
                     "source_change_counts":{k:change_summary[k] for k in ("changed_count","new_count","deleted_count","scan_truncated")},"truncated":True}
@@ -1061,6 +1144,13 @@ class MemoryStore:
             blocked=db.execute("SELECT p.id FROM dependencies d JOIN tasks p ON p.id=d.depends_on WHERE d.task_id=? AND p.status<>'done'",(task_id,)).fetchone()
             if blocked: raise ValueError(f"Task is blocked by unfinished dependency {blocked[0]}")
             if row["blocked_reason"]: raise ValueError(f"Task is blocked: {row['blocked_reason']}")
+            if row["approval_proposal_id"]:
+                proposal=db.execute("SELECT approval_required FROM proposals WHERE id=? AND project_id=?",(row["approval_proposal_id"],project_id)).fetchone()
+                if not proposal: raise ValueError("Task approval proposal is missing from this project")
+                if proposal["approval_required"]:
+                    approval=self._proposal_status(db,row["approval_proposal_id"])
+                    if approval["status"]!="approved":
+                        raise ValueError(f"Task requires current approval for proposal {row['approval_proposal_id']}; current status is {approval['status']}")
             if row["owner"] and row["lease_until"]>now and row["owner"]!=owner: raise ValueError(f"Task is currently claimed by {row['owner']}")
             if row["owner"] == owner and row["lease_until"] > now:
                 db.execute("UPDATE tasks SET lease_until=?,updated_at=? WHERE id=?",(now+lease_seconds,now,task_id))
@@ -1116,7 +1206,13 @@ class MemoryStore:
                 all((r["id"] in req_checks and req_checks[r["id"]].get("revision")==r["revision"] and
                      req_checks[r["id"]].get("met") is True and bool(req_checks[r["id"]].get("evidence")))
                     for r in req_context["applicable_requirements"]) and req_context["requirements_complete"]))
-            final_status="done" if requested_done and all_met and requirements_met else "in_progress"
+            approval_met=True
+            if row["approval_proposal_id"]:
+                gated_proposal=db.execute("SELECT approval_required FROM proposals WHERE project_id=? AND id=?",(project_id,row["approval_proposal_id"])).fetchone()
+                if not gated_proposal: raise ValueError("Task approval proposal is missing from this project")
+                if gated_proposal["approval_required"]:
+                    approval_met=self._proposal_status(db,row["approval_proposal_id"])["status"]=="approved"
+            final_status="done" if requested_done and all_met and requirements_met and approval_met else "in_progress"
             body=_json(receipt)
             db.execute("INSERT INTO receipts(id,task_id,project_id,owner,body,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?)",(receipt_id,task_id,project_id,owner,body,now,idempotency_key))
             for lesson_id in receipt.get("lesson_ids",[]):
@@ -1127,7 +1223,8 @@ class MemoryStore:
             db.commit()
         return {"receipt_id":receipt_id,"status":final_status,"duplicate":False,"completion_accepted":final_status=="done",
                 "note":("Done requires every acceptance check to include met=true and evidence." if requested_done and not all_met else
-                        "Done also requires the current requirements_revision and evidence-backed checks for every applicable current requirement." if requested_done and not requirements_met else "")}
+                        "Done also requires the current requirements_revision and evidence-backed checks for every applicable current requirement." if requested_done and not requirements_met else
+                        "Done also requires current approval for the linked approval-required proposal." if requested_done and not approval_met else "")}
 
     def release_task(self, project_id: str, task_id: str, owner: str, lease_token: str) -> dict[str, Any]:
         with self.connect(project_id) as db:
@@ -1181,7 +1278,7 @@ class MemoryStore:
     _DECISION_STATUSES = {"proposed", "current", "superseded", "withdrawn"}
 
     def _record_revision(self, db: sqlite3.Connection, project_id: str, kind: str) -> int:
-        column = "requirements_revision" if kind == "requirement" else "decisions_revision"
+        column = "requirements_revision" if kind == "requirement" else "decisions_revision" if kind == "decision" else "approvals_revision"
         db.execute("INSERT OR IGNORE INTO project_record_revisions(project_id) VALUES(?)", (project_id,))
         db.execute(f"UPDATE project_record_revisions SET {column}={column}+1 WHERE project_id=?", (project_id,))
         return int(db.execute(f"SELECT {column} FROM project_record_revisions WHERE project_id=?", (project_id,)).fetchone()[0])
@@ -1209,10 +1306,13 @@ class MemoryStore:
         db.execute("INSERT OR IGNORE INTO record_counters(project_id,kind,next_value) VALUES(?,?,1)", (project_id, kind))
         value = int(db.execute("SELECT next_value FROM record_counters WHERE project_id=? AND kind=?", (project_id, kind)).fetchone()[0])
         db.execute("UPDATE record_counters SET next_value=? WHERE project_id=? AND kind=?", (value + 1, project_id, kind))
-        return f"{'REQ' if kind == 'requirement' else 'DEC'}-{value:04d}"
+        prefix={"requirement":"REQ","decision":"DEC","proposal":"PRP"}.get(kind,"REC")
+        return f"{prefix}-{value:04d}"
 
     def _projection_text(self, project_id: str, kind: str) -> tuple[str, int, int]:
-        table, revision_col, json_fields = ("requirements", "requirements_revision", ("scope", "criteria", "fulfillment_evidence")) if kind == "requirements" else ("decisions", "decisions_revision", ("scope", "alternatives"))
+        if kind not in {"requirements","decisions","approvals"}: raise ValueError("kind must be requirements, decisions, or approvals")
+        table, revision_col, json_fields = (("requirements", "requirements_revision", ("scope", "criteria", "fulfillment_evidence")) if kind == "requirements" else
+            ("decisions", "decisions_revision", ("scope", "alternatives")) if kind == "decisions" else ("proposals", "approvals_revision", ("targets",)))
         with self.connect(project_id) as db:
             rows = db.execute(f"SELECT * FROM {table} WHERE project_id=? ORDER BY created_at,id", (project_id,)).fetchall()
             revrow = db.execute(f"SELECT {revision_col} FROM project_record_revisions WHERE project_id=?", (project_id,)).fetchone()
@@ -1227,6 +1327,18 @@ class MemoryStore:
                 r = self._row_json(row, json_fields)
                 sections.append(f"## {r['id']} — {r['title']}\n\n- Lifecycle: `{r['lifecycle']}`; fulfillment: `{r['fulfillment']}`; revision: {r['revision']}\n- Kind: {r['kind']}\n- Requirement: {r['statement']}\n- User wording: {r['original_quote'] or '(not recorded)'}\n- Interpretation: {r['interpretation'] or '(none)'}\n- Scope: `{_json(r['scope'])}`\n- Rationale: {r['rationale'] or '(not recorded)'}\n- Criteria: {_json(r['criteria'])}\n- Fulfillment evidence: {_json(r['fulfillment_evidence'])}\n- Source: {r['source_type']} {r['source_ref']} {r['source_date']}\n- Supersedes: {r['supersedes_id'] or '(none)'}\n")
         else:
+            if kind=="approvals":
+                sections=["<!-- Generated from AgentMem SQLite. Edit proposals and approval events through AgentMem; manual edits are preserved as conflicts. -->",f"# Proposal approvals\n\nRevision: {revision}. Approval applies only to the exact proposal revision/hash and target versions listed in its immutable event. An edit makes the current proposal stale until it is reviewed again.\n"]
+                for row in rows:
+                    proposal=self._row_json(row,("targets",))
+                    state=self.proposal_status(project_id,proposal["id"])
+                    sections.append(f"## {proposal['id']} — {proposal['title']}\n\n- Current revision: {proposal['revision']}; content SHA-256: `{proposal['content_sha256']}`\n- Approval required: `{bool(proposal['approval_required'])}`; current approval status: `{state['status']}`\n- Source: {proposal['source_type'] or '(not recorded)'} {proposal['source_ref'] or '(not recorded)'} {proposal['source_date'] or '(unknown)'}\n- Current content:\n\n{proposal['content']}\n\n- Pinned targets: `{_json([{'kind':x['kind'],'id':x['id'],'revision':x['revision'],'sha256':x['snapshot_sha256']} for x in proposal['targets']])}`\n")
+                    with self.connect(project_id) as db:
+                        events=db.execute("SELECT * FROM approval_events WHERE project_id=? AND proposal_id=? ORDER BY id",(project_id,proposal["id"])).fetchall()
+                    for event in events:
+                        snapshot=json.loads(event["proposal_snapshot"])
+                        sections.append(f"### Approval event `{event['event_id']}`\n\n- Decision: `{event['decision']}`; proposal revision: {event['proposal_revision']}; proposal hash: `{event['proposal_sha256']}`\n- Approved content snapshot title: {snapshot.get('title','(snapshot unavailable)')}\n- Approved content snapshot:\n\n{snapshot.get('content','(snapshot unavailable)')}\n\n- Wording: {event['original_quote']}\n- Source: {event['source_type']} {event['source_ref']} {event['source_date'] or '(unknown)'}; recorded by: {event['recorded_by']}\n- Targets: `{_json([{'kind':x['kind'],'id':x['id'],'revision':x['revision'],'sha256':x['snapshot_sha256']} for x in json.loads(event['target_snapshots'])])}`\n")
+                return "\n".join(sections).rstrip()+"\n",revision,len(rows)
             sections = ["<!-- Generated from AgentMem SQLite. Edit records through AgentMem; manual edits are preserved as conflicts. -->", f"# Project decisions\n\nRevision: {revision}. Current decisions remain auditable through revision history.\n"]
             for row in rows:
                 r = self._row_json(row, json_fields)
@@ -1234,12 +1346,12 @@ class MemoryStore:
         return "\n".join(sections).rstrip() + "\n", revision, len(rows)
 
     def sync_records_projection(self, project_id: str, kind: str, force: bool = False) -> dict[str, Any]:
-        if kind not in {"requirements", "decisions"}: raise ValueError("kind must be requirements or decisions")
+        if kind not in {"requirements", "decisions", "approvals"}: raise ValueError("kind must be requirements, decisions, or approvals")
         project = self.get_project(project_id)
         root = Path(project["memory_root"]).resolve(strict=True)
         destination = root / f"{kind}.md"
         if destination.is_symlink() or getattr(destination, "is_junction", lambda: False)(): raise ValueError("Generated projection cannot be a symlink or junction")
-        revision_col = "requirements_revision" if kind == "requirements" else "decisions_revision"
+        revision_col = {"requirements":"requirements_revision","decisions":"decisions_revision","approvals":"approvals_revision"}[kind]
         for _ in range(4):
             content, revision, count = self._projection_text(project_id, kind)
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -1265,6 +1377,9 @@ class MemoryStore:
                     temp.replace(destination)
                 db.execute("INSERT INTO knowledge_projections(project_id,kind,content_hash,rendered_revision,record_count,synced_at) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,kind) DO UPDATE SET content_hash=excluded.content_hash,rendered_revision=excluded.rendered_revision,record_count=excluded.record_count,synced_at=excluded.synced_at", (project_id, kind, digest, revision, count, time.time()))
                 db.commit()
+                if kind=="approvals":
+                    with self.connect(project_id) as index_db:
+                        self._index_file(index_db,project_id,"@memory/approvals.md",destination,time.time())
                 return {"project_id": project_id, "kind": kind, "path": str(destination), "revision": revision, "record_count": count, "sha256": digest}
         raise RuntimeError("Project records changed repeatedly while rendering the projection; retry the sync")
 
@@ -1443,6 +1558,243 @@ class MemoryStore:
         self.sync_records_projection(project_id,"decisions")
         return self.get_decision(project_id,decision_id)
 
+    # Proposals preserve the exact material a user reviews. Approval events pin
+    # both that proposal revision and immutable snapshots of its linked records.
+    def _snapshot_targets(self, db: sqlite3.Connection, project_id: str, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(targets,list) or len(targets)>MAX_PROPOSAL_TARGETS:
+            raise ValueError(f"targets must be a list of at most {MAX_PROPOSAL_TARGETS} records")
+        if not isinstance(targets,list): raise ValueError("targets must be a list")
+        snapshots=[]; seen=set()
+        for target in targets:
+            if not isinstance(target,dict) or target.get("kind") not in {"requirement","decision"}:
+                raise ValueError("each target needs kind='requirement' or 'decision', id, and revision")
+            kind=target["kind"]; record_id=str(target.get("id","")).strip(); revision=target.get("revision")
+            if not record_id or not isinstance(revision,int) or revision<1: raise ValueError("each target needs a non-empty id and positive integer revision")
+            key=(kind,record_id)
+            if key in seen: raise ValueError(f"duplicate target {kind}:{record_id}")
+            seen.add(key)
+            table="requirements" if kind=="requirement" else "decisions"
+            row=db.execute(f"SELECT * FROM {table} WHERE project_id=? AND id=?",(project_id,record_id)).fetchone()
+            if not row: raise ValueError(f"Target {kind}:{record_id} does not belong to this project")
+            snapshot=dict(row)
+            json_fields=("scope","criteria","fulfillment_evidence") if kind=="requirement" else ("scope","alternatives")
+            for field in json_fields: snapshot[field]=json.loads(snapshot[field])
+            if kind=="decision": snapshot["requirement_ids"]=[x[0] for x in db.execute("SELECT requirement_id FROM decision_requirements WHERE decision_id=? ORDER BY requirement_id",(record_id,))]
+            if snapshot["revision"]!=revision: raise ValueError(f"Target revision conflict for {kind}:{record_id}; current is {snapshot['revision']}")
+            digest=hashlib.sha256(_json(snapshot).encode("utf-8")).hexdigest()
+            snapshots.append({"kind":kind,"id":record_id,"revision":revision,"snapshot_sha256":digest,"snapshot":snapshot})
+        return snapshots
+
+    def _proposal_status(self, db: sqlite3.Connection, proposal_id: str) -> dict[str, Any]:
+        proposal=db.execute("SELECT * FROM proposals WHERE project_id=(SELECT project_id FROM proposals WHERE id=?) AND id=?",(proposal_id,proposal_id)).fetchone()
+        if not proposal: raise ValueError("Proposal not found in this project")
+        row=dict(proposal)
+        event=db.execute("SELECT * FROM approval_events WHERE project_id=? AND proposal_id=? ORDER BY id DESC LIMIT 1",(row["project_id"],proposal_id)).fetchone()
+        if not event:
+            status="not_recorded"
+            current_targets=json.loads(row["targets"])
+        else:
+            current_targets=json.loads(event["target_snapshots"])
+            if event["proposal_revision"]!=row["revision"] or event["proposal_sha256"]!=row["content_sha256"]:
+                status="stale_proposal"
+            else:
+                stale=[]
+                for target in current_targets:
+                    table="requirements" if target["kind"]=="requirement" else "decisions"
+                    current=db.execute(f"SELECT revision FROM {table} WHERE project_id=? AND id=?",(row["project_id"],target["id"])).fetchone()
+                    if not current or current["revision"]!=target["revision"]: stale.append(f"{target['kind']}:{target['id']}")
+                status="stale_target" if stale else event["decision"]
+        stale_current_targets=[]
+        for target in json.loads(row["targets"]):
+            table="requirements" if target["kind"]=="requirement" else "decisions"
+            current=db.execute(f"SELECT revision FROM {table} WHERE project_id=? AND id=?",(row["project_id"],target["id"])).fetchone()
+            if not current or current["revision"]!=target["revision"]: stale_current_targets.append(f"{target['kind']}:{target['id']}")
+        if not event and stale_current_targets: status="not_recorded_stale_target"
+        latest=dict(event) if event else None
+        if latest:
+            # Status is used in bounded task packets; keep full immutable content
+            # available from approval_history, not in every context response.
+            target_snapshots=json.loads(latest["target_snapshots"])
+            proposal_snapshot=json.loads(latest["proposal_snapshot"])
+            latest["target_snapshots"]=[{"kind":t["kind"],"id":t["id"],"revision":t["revision"],"snapshot_sha256":t["snapshot_sha256"]} for t in target_snapshots]
+            latest["proposal_snapshot"]={"title":proposal_snapshot.get("title",""),"revision":latest["proposal_revision"],"content_sha256":latest["proposal_sha256"]}
+            latest["full_snapshot_in_history"]=True
+        return {"proposal_id":proposal_id,"status":status,"approval_required":bool(row["approval_required"]),
+                "proposal_revision":row["revision"],"proposal_sha256":row["content_sha256"],
+                "approved_revision":event["proposal_revision"] if event and event["decision"]=="approved" else None,
+                "target_status":"stale" if stale_current_targets else "current",
+                "stale_targets":stale_current_targets,
+                "latest_event":latest}
+
+    def _proposal_json(self, row: sqlite3.Row) -> dict[str, Any]:
+        value=dict(row); value["targets"]=json.loads(value["targets"]); value["approval_required"]=bool(value["approval_required"])
+        return value
+
+    def create_proposal(self, project_id: str, title: str, content: str, *, targets: list[dict[str, Any]] | None = None,
+                        approval_required: bool = False, source_type: str = "", source_ref: str = "",
+                        source_date: str = "", created_by: str = "agent", idempotency_key: str = "") -> dict[str, Any]:
+        if not title.strip() or not content.strip(): raise ValueError("title and content are required")
+        if len(content.encode("utf-8"))>MAX_PROPOSAL_BYTES: raise ValueError(f"proposal content exceeds {MAX_PROPOSAL_BYTES} bytes")
+        if not idempotency_key.strip(): raise ValueError("idempotency_key is required")
+        self.get_project(project_id)
+        now=time.time(); normalized={"title":title.strip(),"content":content,"approval_required":bool(approval_required),"source_type":source_type,"source_ref":source_ref,"source_date":source_date,"created_by":created_by.strip() or "agent","targets":targets or []}
+        request_hash=hashlib.sha256(_json(normalized).encode("utf-8")).hexdigest()
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior=db.execute("SELECT proposal_id,request_hash FROM proposal_history WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
+            if prior:
+                if prior["request_hash"]!=request_hash: raise ValueError("idempotency_key was already used with different proposal content")
+                db.commit(); return self.get_proposal(project_id,prior["proposal_id"])
+            target_snapshots=self._snapshot_targets(db,project_id,normalized["targets"])
+            proposal_id=self._next_record_id(db,project_id,"proposal")
+            digest=hashlib.sha256(_json({"title":normalized["title"],"content":content}).encode("utf-8")).hexdigest()
+            db.execute("INSERT INTO proposals(id,project_id,title,content,targets,approval_required,source_type,source_ref,source_date,created_by,revision,content_sha256,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+                       (proposal_id,project_id,normalized["title"],content,_json(target_snapshots),int(approval_required),source_type,source_ref,source_date,normalized["created_by"],digest,now,now))
+            snap=dict(db.execute("SELECT * FROM proposals WHERE id=?",(proposal_id,)).fetchone()); snap["targets"]=target_snapshots
+            db.execute("INSERT INTO proposal_history(project_id,proposal_id,revision,snapshot,action,change_note,idempotency_key,request_hash,recorded_at) VALUES(?,?,1,?,'created','',?,?,?)",(project_id,proposal_id,_json(snap),idempotency_key,request_hash,now))
+            self._record_revision(db,project_id,"approval"); db.commit()
+        self.sync_records_projection(project_id,"approvals")
+        return self.get_proposal(project_id,proposal_id)
+
+    def get_proposal(self, project_id: str, proposal_id: str) -> dict[str, Any]:
+        with self.connect(project_id) as db:
+            row=db.execute("SELECT * FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone()
+            if not row: raise ValueError("Proposal not found in this project")
+            result=self._proposal_json(row); result["approval"]=self._proposal_status(db,proposal_id)
+        return result
+
+    def list_proposals(self, project_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        if not 1<=limit<=100 or offset<0: raise ValueError("limit must be 1-100 and offset non-negative")
+        self.sync_records_projection(project_id,"approvals")
+        with self.connect(project_id) as db:
+            total=db.execute("SELECT count(*) FROM proposals WHERE project_id=?",(project_id,)).fetchone()[0]
+            rows=db.execute("SELECT * FROM proposals WHERE project_id=? ORDER BY updated_at DESC,id LIMIT ? OFFSET ?",(project_id,limit,offset)).fetchall()
+            result=[]
+            for row in rows:
+                item=self._proposal_json(row); item["approval"]=self._proposal_status(db,item["id"]); item.pop("content",None)
+                result.append(item)
+        return {"project_id":project_id,"count":total,"offset":offset,"limit":limit,"next_offset":offset+len(result) if offset+len(result)<total else None,"proposals":result}
+
+    def update_proposal(self, project_id: str, proposal_id: str, *, expected_revision: int, idempotency_key: str,
+                        title: str | None = None, content: str | None = None, targets: list[dict[str, Any]] | None = None,
+                        approval_required: bool | None = None, source_type: str = "", source_ref: str = "",
+                        source_date: str = "", change_note: str = "") -> dict[str, Any]:
+        if not idempotency_key.strip(): raise ValueError("idempotency_key is required")
+        now=time.time()
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row=db.execute("SELECT * FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone()
+            if not row: raise ValueError("Proposal not found in this project")
+            existing=self._proposal_json(row)
+            payload={"title":(title.strip() if title is not None else existing["title"]),"content":content if content is not None else existing["content"],
+                     "approval_required":bool(approval_required) if approval_required is not None else existing["approval_required"],"targets":targets if targets is not None else [{"kind":t["kind"],"id":t["id"],"revision":t["revision"]} for t in existing["targets"]],
+                     "source_type":source_type or existing["source_type"],"source_ref":source_ref or existing["source_ref"],"source_date":source_date or existing["source_date"]}
+            if not payload["title"].strip() or not payload["content"].strip(): raise ValueError("title and content are required")
+            if len(payload["content"].encode("utf-8"))>MAX_PROPOSAL_BYTES: raise ValueError(f"proposal content exceeds {MAX_PROPOSAL_BYTES} bytes")
+            request_hash=hashlib.sha256(_json({"proposal_id":proposal_id,"expected_revision":expected_revision,"payload":payload}).encode("utf-8")).hexdigest()
+            prior=db.execute("SELECT request_hash FROM proposal_history WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
+            if prior:
+                if prior["request_hash"]!=request_hash: raise ValueError("idempotency_key was already used with different proposal content")
+                db.commit(); return self.get_proposal(project_id,proposal_id)
+            if row["revision"]!=expected_revision: raise ValueError(f"revision conflict: expected {expected_revision}, current is {row['revision']}")
+            target_snapshots=self._snapshot_targets(db,project_id,payload["targets"])
+            digest=hashlib.sha256(_json({"title":payload["title"],"content":payload["content"]}).encode("utf-8")).hexdigest(); next_revision=row["revision"]+1
+            db.execute("UPDATE proposals SET title=?,content=?,targets=?,approval_required=?,source_type=?,source_ref=?,source_date=?,revision=?,content_sha256=?,updated_at=? WHERE project_id=? AND id=?",
+                       (payload["title"],payload["content"],_json(target_snapshots),int(payload["approval_required"]),payload["source_type"],payload["source_ref"],payload["source_date"],next_revision,digest,now,project_id,proposal_id))
+            snap=dict(db.execute("SELECT * FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone()); snap["targets"]=target_snapshots
+            db.execute("INSERT INTO proposal_history(project_id,proposal_id,revision,snapshot,action,change_note,idempotency_key,request_hash,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",(project_id,proposal_id,next_revision,_json(snap),"updated",change_note,idempotency_key,request_hash,now))
+            self._record_revision(db,project_id,"approval"); db.commit()
+        self.sync_records_projection(project_id,"approvals")
+        return self.get_proposal(project_id,proposal_id)
+
+    def _record_approval_event(self, project_id: str, proposal_id: str, decision: str, *, expected_revision: int,
+                               original_quote: str, source_type: str, source_ref: str, source_date: str,
+                               recorded_by: str, idempotency_key: str, target_event_id: str = "") -> dict[str, Any]:
+        if decision not in {"approved","rejected","withdrawn"}: raise ValueError("decision must be approved, rejected, or withdrawn")
+        if not all(x.strip() for x in (original_quote,source_type,source_ref,recorded_by,idempotency_key)):
+            raise ValueError("approval wording, source_type, source_ref, recorded_by, and idempotency_key are required")
+        now=time.time(); request={"proposal_id":proposal_id,"decision":decision,"expected_revision":expected_revision,"original_quote":original_quote,"source_type":source_type,"source_ref":source_ref,"source_date":source_date,"recorded_by":recorded_by,"target_event_id":target_event_id}
+        request_hash=hashlib.sha256(_json(request).encode("utf-8")).hexdigest()
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior=db.execute("SELECT * FROM approval_events WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
+            if prior:
+                if prior["request_hash"]!=request_hash: raise ValueError("idempotency_key was already used with different approval content")
+                db.commit(); return dict(prior)|{"target_snapshots":json.loads(prior["target_snapshots"]),"proposal_snapshot":json.loads(prior["proposal_snapshot"]),"duplicate":True}
+            proposal=db.execute("SELECT * FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone()
+            if not proposal: raise ValueError("Proposal not found in this project")
+            if proposal["revision"]!=expected_revision: raise ValueError(f"proposal revision conflict: expected {expected_revision}, current is {proposal['revision']}")
+            if decision=="withdrawn":
+                old=db.execute("SELECT * FROM approval_events WHERE project_id=? AND event_id=? AND proposal_id=?",(project_id,target_event_id,proposal_id)).fetchone()
+                if not old or old["decision"]!="approved": raise ValueError("target_event_id must identify an approved event for this proposal")
+                latest=db.execute("SELECT event_id,decision,proposal_revision,proposal_sha256 FROM approval_events WHERE project_id=? AND proposal_id=? ORDER BY id DESC LIMIT 1",(project_id,proposal_id)).fetchone()
+                if not latest or latest["event_id"]!=target_event_id or latest["decision"]!="approved":
+                    raise ValueError("only the latest current approved event can be withdrawn")
+                if old["proposal_revision"]!=proposal["revision"] or old["proposal_sha256"]!=proposal["content_sha256"]:
+                    raise ValueError("cannot withdraw an approval for a stale proposal revision")
+                targets=json.loads(old["target_snapshots"]); pinned_revision=old["proposal_revision"]; pinned_hash=old["proposal_sha256"]
+                proposal_snapshot=json.loads(old["proposal_snapshot"])
+            else:
+                targets=json.loads(proposal["targets"]); pinned_revision=proposal["revision"]; pinned_hash=proposal["content_sha256"]
+                for target in targets:
+                    table="requirements" if target["kind"]=="requirement" else "decisions"
+                    current=db.execute(f"SELECT revision FROM {table} WHERE project_id=? AND id=?",(project_id,target["id"])).fetchone()
+                    if not current or current["revision"]!=target["revision"]: raise ValueError(f"Cannot {decision}: target {target['kind']}:{target['id']} changed; update the proposal to pin a current version first")
+                proposal_snapshot=self._proposal_json(proposal)
+            event_id=uuid.uuid4().hex
+            db.execute("INSERT INTO approval_events(event_id,project_id,proposal_id,proposal_revision,proposal_sha256,proposal_snapshot,target_snapshots,decision,original_quote,source_type,source_ref,source_date,recorded_by,target_event_id,idempotency_key,request_hash,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (event_id,project_id,proposal_id,pinned_revision,pinned_hash,_json(proposal_snapshot),_json(targets),decision,original_quote,source_type,source_ref,source_date or "unknown",recorded_by,target_event_id,idempotency_key,request_hash,now))
+            self._record_revision(db,project_id,"approval"); db.commit()
+            result=dict(db.execute("SELECT * FROM approval_events WHERE event_id=?",(event_id,)).fetchone()); result["target_snapshots"]=targets; result["proposal_snapshot"]=proposal_snapshot
+        self.sync_records_projection(project_id,"approvals")
+        return result
+
+    def approve_proposal(self, project_id: str, proposal_id: str, *, expected_revision: int,
+                         original_quote: str, source_type: str, source_ref: str, source_date: str = "unknown",
+                         recorded_by: str, idempotency_key: str) -> dict[str, Any]:
+        return self._record_approval_event(project_id,proposal_id,"approved",expected_revision=expected_revision,
+            original_quote=original_quote,source_type=source_type,source_ref=source_ref,source_date=source_date,
+            recorded_by=recorded_by,idempotency_key=idempotency_key)
+
+    def reject_proposal(self, project_id: str, proposal_id: str, *, expected_revision: int,
+                        original_quote: str, source_type: str, source_ref: str, source_date: str = "unknown",
+                        recorded_by: str, idempotency_key: str) -> dict[str, Any]:
+        return self._record_approval_event(project_id,proposal_id,"rejected",expected_revision=expected_revision,
+            original_quote=original_quote,source_type=source_type,source_ref=source_ref,source_date=source_date,
+            recorded_by=recorded_by,idempotency_key=idempotency_key)
+
+    def withdraw_proposal_approval(self, project_id: str, proposal_id: str, event_id: str, *, expected_revision: int,
+                                   original_quote: str, source_type: str, source_ref: str, source_date: str = "unknown",
+                                   recorded_by: str, idempotency_key: str) -> dict[str, Any]:
+        return self._record_approval_event(project_id,proposal_id,"withdrawn",expected_revision=expected_revision,
+            original_quote=original_quote,source_type=source_type,source_ref=source_ref,source_date=source_date,
+            recorded_by=recorded_by,idempotency_key=idempotency_key,target_event_id=event_id)
+
+    def approval_history(self, project_id: str, proposal_id: str, limit: int = 100) -> dict[str, Any]:
+        if not 1<=limit<=200: raise ValueError("limit must be between 1 and 200")
+        self.get_project(project_id)
+        with self.connect(project_id) as db:
+            if not db.execute("SELECT 1 FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone(): raise ValueError("Proposal not found in this project")
+            total=db.execute("SELECT count(*) FROM approval_events WHERE project_id=? AND proposal_id=?",(project_id,proposal_id)).fetchone()[0]
+            rows=db.execute("SELECT * FROM approval_events WHERE project_id=? AND proposal_id=? ORDER BY id DESC LIMIT ?",(project_id,proposal_id,limit)).fetchall()
+        events=[]
+        for row in rows:
+            event=dict(row); event["target_snapshots"]=json.loads(event["target_snapshots"]); event["proposal_snapshot"]=json.loads(event["proposal_snapshot"]); events.append(event)
+        return {"project_id":project_id,"proposal_id":proposal_id,"events":events,"count":total,"truncated":total>len(events)}
+
+    def proposal_history(self, project_id: str, proposal_id: str, limit: int = 50) -> dict[str, Any]:
+        if not 1<=limit<=100: raise ValueError("limit must be between 1 and 100")
+        with self.connect(project_id) as db:
+            if not db.execute("SELECT 1 FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone(): raise ValueError("Proposal not found in this project")
+            rows=db.execute("SELECT * FROM proposal_history WHERE project_id=? AND proposal_id=? ORDER BY revision DESC LIMIT ?",(project_id,proposal_id,limit)).fetchall()
+            total=db.execute("SELECT count(*) FROM proposal_history WHERE project_id=? AND proposal_id=?",(project_id,proposal_id)).fetchone()[0]
+        return {"project_id":project_id,"proposal_id":proposal_id,"revisions":[dict(r)|{"snapshot":json.loads(r["snapshot"])} for r in rows],"count":total,"truncated":total>len(rows)}
+
+    def proposal_status(self, project_id: str, proposal_id: str) -> dict[str, Any]:
+        with self.connect(project_id) as db:
+            if not db.execute("SELECT 1 FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone(): raise ValueError("Proposal not found in this project")
+            return self._proposal_status(db,proposal_id)
+
     def _task_requirements(self, project_id: str, task: dict[str, Any], offset: int, limit: int,
                            connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         if offset<0 or not 1<=limit<=1000: raise ValueError("requirement_offset must be >=0 and requirements_limit between 1 and 1000")
@@ -1528,10 +1880,14 @@ class MemoryStore:
             decision_history=[dict(x)|{"snapshot":json.loads(x["snapshot"])} for x in db.execute("SELECT * FROM decision_history WHERE project_id=?",(project_id,))]
             decision_requirements=[dict(x) for x in db.execute("SELECT dr.* FROM decision_requirements dr JOIN decisions d ON d.id=dr.decision_id WHERE d.project_id=?",(project_id,))]
             task_requirement_links=[dict(x) for x in db.execute("SELECT tr.* FROM task_requirement_links tr JOIN tasks t ON t.id=tr.task_id WHERE t.project_id=?",(project_id,))]
-            record_revisions=dict(db.execute("SELECT requirements_revision,decisions_revision FROM project_record_revisions WHERE project_id=?",(project_id,)).fetchone() or {})
-        return {"schema_version":3,"exported_at":time.time(),"project":project,"tasks":tasks,"dependencies":deps,"receipts":receipts,"lessons":lessons,"lesson_uses":lesson_uses,
+            proposals=[self._proposal_json(x) for x in db.execute("SELECT * FROM proposals WHERE project_id=? ORDER BY created_at,id",(project_id,))]
+            proposal_history=[dict(x)|{"snapshot":json.loads(x["snapshot"])} for x in db.execute("SELECT * FROM proposal_history WHERE project_id=? ORDER BY id",(project_id,))]
+            approval_events=[dict(x)|{"target_snapshots":json.loads(x["target_snapshots"]),"proposal_snapshot":json.loads(x["proposal_snapshot"])} for x in db.execute("SELECT * FROM approval_events WHERE project_id=? ORDER BY id",(project_id,))]
+            record_revisions=dict(db.execute("SELECT requirements_revision,decisions_revision,approvals_revision FROM project_record_revisions WHERE project_id=?",(project_id,)).fetchone() or {})
+        return {"schema_version":4,"exported_at":time.time(),"project":project,"tasks":tasks,"dependencies":deps,"receipts":receipts,"lessons":lessons,"lesson_uses":lesson_uses,
                 "requirements":requirements,"requirement_history":requirement_history,"decisions":decisions,"decision_history":decision_history,
-                "decision_requirements":decision_requirements,"task_requirement_links":task_requirement_links,"record_revisions":record_revisions,"knowledge_manifest":knowledge_manifest}
+                "decision_requirements":decision_requirements,"task_requirement_links":task_requirement_links,"proposals":proposals,
+                "proposal_history":proposal_history,"approval_events":approval_events,"record_revisions":record_revisions,"knowledge_manifest":knowledge_manifest}
 
     def update_project_brief(self, project_id: str, markdown: str) -> dict[str, Any]:
         project = self.get_project(project_id)
