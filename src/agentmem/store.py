@@ -15,12 +15,23 @@ from typing import Any
 
 DEFAULT_DATA = Path(os.environ.get("AGENTMEM_DATA_DIR", Path.home() / ".agentmem"))
 DEFAULT_MEMORY_ROOT = Path(os.environ.get("AGENTMEM_MEMORY_ROOT", "D:/projects" if os.name == "nt" else Path.home() / "projects"))
-EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "target", "__pycache__", ".agentmem-data", ".agentmem", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
+EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "target", "__pycache__", ".agentmem-data", ".agentmem", ".history", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
 SECRET_NAME = re.compile(r"(^|[._-])(\.env(?:\..*)?|secrets?|credentials?)([._-]|$)", re.I)
 SECRET_SUFFIXES = {".pem", ".key", ".token", ".secret", ".p12", ".pfx", ".cer", ".crt", ".sqlite", ".db"}
 SENSITIVE_BASENAMES = {".npmrc", ".pypirc", ".netrc", "id_rsa", "id_ed25519", "id_ecdsa"}
 TEXT_SUFFIXES = {".md", ".txt", ".rst", ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".css", ".scss", ".sql", ".sh", ".ps1", ".bat", ".java", ".kt", ".go", ".rs", ".c", ".h", ".cpp", ".cs", ".swift", ".rb", ".php", ".vue", ".svelte", ".graphql", ".proto", ".ini", ".cfg", ".csv", ".log"}
 MAX_FILE_BYTES = 512_000
+MAX_KNOWLEDGE_PAGE_BYTES = 48_000
+MAX_KNOWLEDGE_OUTPUT_CHARS = 12_000
+KNOWLEDGE_PAGE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+RESERVED_KNOWLEDGE_PAGE_IDS = {"requirements", "decisions", "index", "project"}
+KNOWLEDGE_PAGE_TEMPLATES = {
+    "purpose": ("Purpose and scope", "Document verified project goals, users, boundaries, and non-goals.\n\nNot documented yet."),
+    "architecture": ("Architecture", "Document the major components, interfaces, data flows, and rationale. Link source files rather than copying large code excerpts.\n\nNot documented yet."),
+    "risks": ("Risks and open questions", "Record known risks, dependencies, assumptions, and unresolved questions. Distinguish verified risks from hypotheses.\n\nNot documented yet."),
+    "history": ("Project history", "Record meaningful dated milestones and why they happened. Keep task execution details in the task and receipt records.\n\nNot documented yet."),
+    "materials": ("Project materials", "Catalog important source repositories and documents, their locations, and whether their content has been indexed or reviewed. Do not imply that a catalog entry has been ingested.\n\nNot documented yet."),
+}
 
 
 def _json(value: Any) -> str:
@@ -500,6 +511,27 @@ class MemoryStore:
         finally:
             db.close()
 
+    def _write_knowledge_scaffold(self, root: Path, project_id: str, source_root: Path, description: str) -> None:
+        knowledge = root / "knowledge"
+        knowledge.mkdir()
+        for page_id, (title, body) in KNOWLEDGE_PAGE_TEMPLATES.items():
+            (knowledge / f"{page_id}.md").write_text(f"# {title}\n\n{body}\n", encoding="utf-8", newline="\n")
+        (root / "PROJECT.md").write_text(
+            f"# {source_root.name} project memory\n\n"
+            f"Project ID: `{project_id}`  \nSource root: `{source_root}`\n\n"
+            f"{description.strip()}\n\n"
+            "This file is the compact project entry point. Replace placeholders only with verified project information.\n\n"
+            "## Knowledge pages\n\n"
+            "- [Purpose and scope](knowledge/purpose.md)\n"
+            "- [Architecture](knowledge/architecture.md)\n"
+            "- [Risks and open questions](knowledge/risks.md)\n"
+            "- [Project history](knowledge/history.md)\n"
+            "- [Project materials](knowledge/materials.md)\n\n"
+            "## Structured records\n\n"
+            "- [Requirements](requirements.md) and [decisions](decisions.md) are generated views of the project's SQLite records.\n"
+            "- Current tasks, checkpoints, receipts, and reviewed lessons are retrieved through AgentMem tools.\n\n"
+            "No project-specific facts have been verified yet.\n", encoding="utf-8", newline="\n")
+
     def register_project(self, project_id: str, root: str | Path, description: str = "", memory_root: str | Path | None = None) -> dict[str, Any]:
         project_id = self._valid_id(project_id)
         root_path = Path(root).expanduser().resolve(strict=True)
@@ -507,6 +539,7 @@ class MemoryStore:
             raise ValueError("Project root must be a directory")
         memory_path = self._safe_memory_path(project_id, root_path, memory_root)
         now = time.time()
+        created = False
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
@@ -518,6 +551,7 @@ class MemoryStore:
                 db.execute("UPDATE projects SET description=? WHERE id=?", (description, project_id))
                 db.commit()
             else:
+                created = True
                 if memory_path.exists():
                     raise FileExistsError(f"Project knowledge directory already exists; it will not be adopted or overwritten: {memory_path}")
                 memory_path.parent.mkdir(parents=True, exist_ok=True)
@@ -525,10 +559,7 @@ class MemoryStore:
                 stage.mkdir()
                 try:
                     self._write_project_manifest(stage, project_id, root_path)
-                    (stage / "PROJECT.md").write_text(
-                        f"# {root_path.name} project memory\n\nRegistered project ID: `{project_id}`\n\n"
-                        f"{description.strip()}\n\n"
-                        "No repository content has been copied into this directory. Add verified project intent, decisions, current status, and links here.\n", encoding="utf-8")
+                    self._write_knowledge_scaffold(stage, project_id, root_path, description)
                     self._create_project_database(stage / "agentmem.sqlite3")
                     project_db = sqlite3.connect(stage / "agentmem.sqlite3")
                     project_db.execute("INSERT INTO projects(id,name,root,description,created_at) VALUES(?,?,?,?,?)",
@@ -544,6 +575,9 @@ class MemoryStore:
                     if stage.exists() and self._manifest_path(stage).exists():
                         self._remove_owned_stage(stage, memory_path.parent, project_id)
                     raise
+        if created:
+            self.sync_records_projection(project_id, "requirements")
+            self.sync_records_projection(project_id, "decisions")
         return self.get_project(project_id)
 
     def _valid_id(self, value: str) -> str:
@@ -623,6 +657,28 @@ class MemoryStore:
             return Path(project["memory_root"]) / Path(relpath[len("@memory/"):])
         return Path(project["root"]) / Path(relpath)
 
+    def _index_file(self, db: sqlite3.Connection, project_id: str, relpath: str, path: Path, now: float) -> bool | None:
+        try:
+            stat=path.stat()
+            text=path.read_text(encoding="utf-8")
+        except (UnicodeError,OSError):
+            return None
+        digest=hashlib.sha256(text.encode("utf-8")).hexdigest()
+        previous=db.execute("SELECT sha256 FROM sources WHERE project_id=? AND relpath=?",(project_id,relpath)).fetchone()
+        if previous and previous["sha256"]==digest:
+            db.execute("UPDATE sources SET indexed_at=?,mtime_ns=?,size_bytes=? WHERE project_id=? AND relpath=?",(now,stat.st_mtime_ns,stat.st_size,project_id,relpath))
+            return False
+        db.execute("DELETE FROM chunks WHERE project_id=? AND relpath=?",(project_id,relpath))
+        db.execute("INSERT INTO sources(project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,relpath) DO UPDATE SET sha256=excluded.sha256,indexed_at=excluded.indexed_at,mtime_ns=excluded.mtime_ns,size_bytes=excluded.size_bytes",
+                   (project_id,relpath,digest,now,stat.st_mtime_ns,stat.st_size))
+        lines=text.splitlines()
+        for start in range(0,len(lines),35):
+            body="\n".join(lines[start:start+35]).strip()
+            if body:
+                db.execute("INSERT INTO chunks(project_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?)",
+                           (project_id,relpath,digest,start+1,min(start+35,len(lines)),body))
+        return True
+
     def index_project(self, project_id: str, max_files: int = 5000) -> dict[str, Any]:
         project = self.get_project(project_id)
         if not 1 <= max_files <= 20000:
@@ -635,28 +691,15 @@ class MemoryStore:
                 scanned += 1
                 if scanned > max_files:
                     break
-                try:
-                    stat=path.stat()
-                    text = path.read_text(encoding="utf-8")
-                except (UnicodeError, OSError):
+                if not self._safe_file(Path(project["memory_root"]) if rel.startswith("@memory/") else Path(project["root"]),path):
                     skipped += 1
                     continue
-                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                seen.add(rel)
-                prev = db.execute("SELECT sha256 FROM sources WHERE project_id=? AND relpath=?", (project_id, rel)).fetchone()
-                if prev and prev["sha256"] == digest:
-                    db.execute("UPDATE sources SET indexed_at=?,mtime_ns=?,size_bytes=? WHERE project_id=? AND relpath=?",(now,stat.st_mtime_ns,stat.st_size,project_id,rel))
+                indexed_change=self._index_file(db,project_id,rel,path,now)
+                if indexed_change is None:
+                    skipped += 1
                     continue
-                db.execute("DELETE FROM chunks WHERE project_id=? AND relpath=?", (project_id, rel))
-                db.execute("INSERT INTO sources(project_id,relpath,sha256,indexed_at,mtime_ns,size_bytes) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,relpath) DO UPDATE SET sha256=excluded.sha256,indexed_at=excluded.indexed_at,mtime_ns=excluded.mtime_ns,size_bytes=excluded.size_bytes",
-                           (project_id, rel, digest, now, stat.st_mtime_ns, stat.st_size))
-                lines = text.splitlines()
-                for start in range(0, len(lines), 35):
-                    body = "\n".join(lines[start:start+35]).strip()
-                    if body:
-                        db.execute("INSERT INTO chunks(project_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?)",
-                                   (project_id, rel, digest, start+1, min(start+35, len(lines)), body))
-                changed += 1
+                seen.add(rel)
+                changed += int(indexed_change)
             current = db.execute("SELECT relpath FROM sources WHERE project_id=?", (project_id,)).fetchall()
             # Never interpret a deliberately truncated scan as deleted source.
             removed = [] if scanned > max_files else [r["relpath"] for r in current if r["relpath"] not in seen]
@@ -751,6 +794,17 @@ class MemoryStore:
         project = self.get_project(project_id)
         max_chars = min(max(max_chars, 1000), 12000)
         change_summary=self.check_project_changes(project_id)
+        try:
+            listed_knowledge=self.list_knowledge_pages(project_id,limit=12)
+            knowledge_pages={"initialized":True,"directory":listed_knowledge["directory"],"count":listed_knowledge["count"],
+                             "unindexed_count":listed_knowledge["unindexed_count"],
+                             "pages":[{"page_id":x["page_id"],"title":x["title"],"path":x["path"],"fresh":x["fresh"]} for x in listed_knowledge["pages"]],
+                             "pages_truncated":listed_knowledge["next_offset"] is not None}
+        except ValueError as exc:
+            if not str(exc).startswith("Knowledge pages are not initialized"):
+                raise
+            knowledge_pages={"initialized":False,"directory":"@memory/knowledge/","count":0,"unindexed_count":0,"pages":[],"pages_truncated":False,
+                             "note":"Call knowledge(action='init') to add missing topic-page scaffolds."}
         with self.connect(project_id) as db:
             tasks = db.execute("SELECT * FROM tasks WHERE project_id=? AND status IN ('open','in_progress') ORDER BY CASE status WHEN 'in_progress' THEN 0 ELSE 1 END,priority,created_at LIMIT 8", (project_id,)).fetchall()
             accepted = db.execute("SELECT id,title,trigger_text,procedure,evidence,updated_at FROM lessons WHERE project_id=? AND status='accepted' ORDER BY updated_at DESC LIMIT 8", (project_id,)).fetchall()
@@ -780,7 +834,7 @@ class MemoryStore:
             if scope.get("project_wide"):
                 invariants.append({"id":r["id"],"title":r["title"],"statement":r["statement"],"fulfillment":r["fulfillment"],"revision":r["revision"]})
         card = {"project": {k: project[k] for k in ("id", "name", "root", "memory_root", "description")},
-                "manager_brief": brief, "tasks": task_list,
+                "manager_brief": brief, "knowledge_pages":knowledge_pages,"tasks": task_list,
                 "requirements":{"revision":int(rv["requirements_revision"]) if rv else 0,"current_count":len(current_reqs),"proposed_count":int(proposed_req_count),"decisions_revision":int(rv["decisions_revision"]) if rv else 0,
                                 "project_wide":invariants[:8],"project_wide_truncated":len(invariants)>8,
                                 "current_decisions":[dict(x) for x in current_decisions],"current_decisions_truncated":current_decision_count>len(current_decisions),
@@ -805,6 +859,9 @@ class MemoryStore:
             card["manager_brief"] = card["manager_brief"][:max_chars//4]
             for key in ("tasks", "accepted_lessons", "indexed_sources"):
                 while len(_json(card)) > max_chars and card[key]: card[key].pop()
+            while len(_json(card))>max_chars and card["knowledge_pages"]["pages"]:
+                card["knowledge_pages"]["pages"].pop()
+                card["knowledge_pages"]["pages_truncated"]=True
             for key in ("current_decisions", "project_wide"):
                 while len(_json(card)) > max_chars and card["requirements"][key]:
                     card["requirements"][key].pop()
@@ -1449,6 +1506,15 @@ class MemoryStore:
 
     def export_project(self, project_id: str) -> dict[str, Any]:
         project=self.get_project(project_id)
+        try:
+            pages=self.list_knowledge_pages(project_id,limit=100)
+            knowledge_manifest={"directory":"knowledge/","page_count":pages["count"],"pages":[{"page_id":x["page_id"],"path":x["path"],"sha256":x["sha256"],"bytes":x["bytes"]} for x in pages["pages"]],
+                               "manifest_truncated":pages["next_offset"] is not None,"note":"Markdown contents remain in the per-project KB and must be copied with the manifest for a complete file backup."}
+        except ValueError as exc:
+            if not str(exc).startswith("Knowledge pages are not initialized"):
+                raise
+            knowledge_manifest={"directory":"knowledge/","page_count":0,"pages":[],"manifest_truncated":False,
+                               "note":"No knowledge pages directory is initialized."}
         with self.connect(project_id) as db:
             tasks=[dict(x) for x in db.execute("SELECT * FROM tasks WHERE project_id=?",(project_id,))]
             for task in tasks: task.pop("lease_token",None)
@@ -1463,9 +1529,9 @@ class MemoryStore:
             decision_requirements=[dict(x) for x in db.execute("SELECT dr.* FROM decision_requirements dr JOIN decisions d ON d.id=dr.decision_id WHERE d.project_id=?",(project_id,))]
             task_requirement_links=[dict(x) for x in db.execute("SELECT tr.* FROM task_requirement_links tr JOIN tasks t ON t.id=tr.task_id WHERE t.project_id=?",(project_id,))]
             record_revisions=dict(db.execute("SELECT requirements_revision,decisions_revision FROM project_record_revisions WHERE project_id=?",(project_id,)).fetchone() or {})
-        return {"schema_version":2,"exported_at":time.time(),"project":project,"tasks":tasks,"dependencies":deps,"receipts":receipts,"lessons":lessons,"lesson_uses":lesson_uses,
+        return {"schema_version":3,"exported_at":time.time(),"project":project,"tasks":tasks,"dependencies":deps,"receipts":receipts,"lessons":lessons,"lesson_uses":lesson_uses,
                 "requirements":requirements,"requirement_history":requirement_history,"decisions":decisions,"decision_history":decision_history,
-                "decision_requirements":decision_requirements,"task_requirement_links":task_requirement_links,"record_revisions":record_revisions}
+                "decision_requirements":decision_requirements,"task_requirement_links":task_requirement_links,"record_revisions":record_revisions,"knowledge_manifest":knowledge_manifest}
 
     def update_project_brief(self, project_id: str, markdown: str) -> dict[str, Any]:
         project = self.get_project(project_id)
@@ -1490,4 +1556,198 @@ class MemoryStore:
         with temp.open("x", encoding="utf-8") as stream:
             stream.write(markdown)
         temp.replace(destination)
-        return {"project_id":project_id,"path":str(destination),"characters":len(markdown)}
+        relpath="@memory/PROJECT.md"
+        with self.connect(project_id) as db:
+            changed=self._index_file(db,project_id,relpath,destination,time.time())
+        return {"project_id":project_id,"path":str(destination),"characters":len(markdown),"indexed":True,"content_changed":changed,"source_revision":self.source_revision(project_id)}
+
+    def _knowledge_directory(self, project_id: str, create: bool = False) -> Path:
+        project=self.get_project(project_id)
+        # Validate the registered root/manifest/database binding before touching content.
+        self._project_database_path(project_id)
+        root=Path(project["memory_root"]).resolve(strict=True)
+        directory=root/"knowledge"
+        if directory.is_symlink() or getattr(directory,"is_junction",lambda:False)():
+            raise ValueError("Knowledge pages directory cannot be a symlink or junction")
+        if directory.exists():
+            if not directory.is_dir():
+                raise ValueError("Knowledge pages directory cannot be a symlink or non-directory")
+            if directory.resolve(strict=True).parent!=root:
+                raise ValueError("Knowledge pages directory escaped the registered project KB")
+        elif create:
+            directory.mkdir()
+        else:
+            raise ValueError("Knowledge pages are not initialized; call knowledge(action='init')")
+        return directory
+
+    def _knowledge_page_id(self, page_id: str) -> str:
+        page_id=page_id.strip().lower()
+        if not KNOWLEDGE_PAGE_ID.fullmatch(page_id) or page_id in RESERVED_KNOWLEDGE_PAGE_IDS:
+            raise ValueError("page_id must be a simple lowercase slug; path separators and reserved IDs are not allowed")
+        return page_id
+
+    def _knowledge_page_path(self, project_id: str, page_id: str, create_directory: bool = False) -> Path:
+        page_id=self._knowledge_page_id(page_id)
+        directory=self._knowledge_directory(project_id,create=create_directory)
+        path=directory/f"{page_id}.md"
+        if path.is_symlink() or getattr(path,"is_junction",lambda:False)():
+            raise ValueError("Knowledge page cannot be a symlink or junction")
+        if path.exists() and (not path.is_file() or path.resolve(strict=True).parent!=directory.resolve(strict=True)):
+            raise ValueError("Knowledge page escaped its registered directory")
+        return path
+
+    def _atomic_markdown_write(self, path: Path, content: str) -> None:
+        temp=path.parent/f".{path.stem}.{uuid.uuid4().hex}.tmp"
+        with temp.open("x",encoding="utf-8",newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(path)
+
+    def _knowledge_page_metadata(self, project_id: str, page_id: str, path: Path) -> dict[str, Any]:
+        content=path.read_text(encoding="utf-8")
+        if len(content.encode("utf-8"))>MAX_KNOWLEDGE_PAGE_BYTES:
+            raise ValueError(f"Knowledge page {page_id!r} exceeds the {MAX_KNOWLEDGE_PAGE_BYTES}-byte limit")
+        digest=hashlib.sha256(content.encode("utf-8")).hexdigest()
+        first_heading=next((line[2:].strip() for line in content.splitlines() if line.startswith("# ")),page_id.replace("-"," ").title())
+        with self.connect(project_id) as db:
+            indexed=db.execute("SELECT sha256,indexed_at FROM sources WHERE project_id=? AND relpath=?",(project_id,f"@memory/knowledge/{page_id}.md")).fetchone()
+        stat=path.stat()
+        return {"page_id":page_id,"title":first_heading,"path":f"@memory/knowledge/{page_id}.md","citation":f"@memory/knowledge/{page_id}.md#L1",
+                "sha256":digest,"indexed_sha256":indexed["sha256"] if indexed else "","fresh":bool(indexed and indexed["sha256"]==digest),
+                "indexed_at":indexed["indexed_at"] if indexed else None,"bytes":stat.st_size,"lines":len(content.splitlines()),"modified_at":stat.st_mtime}
+
+    def initialize_knowledge(self, project_id: str) -> dict[str, Any]:
+        directory=self._knowledge_directory(project_id,create=True)
+        created=[]
+        now=time.time()
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            for page_id,(title,body) in KNOWLEDGE_PAGE_TEMPLATES.items():
+                path=directory/f"{page_id}.md"
+                if path.is_symlink() or getattr(path,"is_junction",lambda:False)():
+                    db.rollback(); raise ValueError(f"Cannot initialize symlink knowledge page {page_id!r}")
+                if path.exists():
+                    if not path.is_file() or path.resolve(strict=True).parent!=directory.resolve(strict=True):
+                        db.rollback(); raise ValueError(f"Knowledge page {page_id!r} is not a safe regular file")
+                    continue
+                content=f"# {title}\n\n{body}\n"
+                self._atomic_markdown_write(path,content)
+                created.append(page_id)
+                self._index_file(db,project_id,f"@memory/knowledge/{page_id}.md",path,now)
+            db.commit()
+        brief=(Path(self.get_project(project_id)["memory_root"])/"PROJECT.md").read_text(encoding="utf-8")
+        return {"project_id":project_id,"created_pages":created,"default_pages_already_present":len(KNOWLEDGE_PAGE_TEMPLATES)-len(created),
+                "pages":self.list_knowledge_pages(project_id)["pages"],"brief_has_navigation":"knowledge/" in brief,
+                "note":"Existing pages and PROJECT.md were not overwritten. Add navigation to PROJECT.md if it does not link to the knowledge pages."}
+
+    def list_knowledge_pages(self, project_id: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        if not 1<=limit<=100 or offset<0:
+            raise ValueError("limit must be 1-100 and offset must be non-negative")
+        directory=self._knowledge_directory(project_id,create=False)
+        ids=[]
+        for path in directory.glob("*.md"):
+            if path.is_symlink() or getattr(path,"is_junction",lambda:False)():
+                continue
+            page_id=path.stem
+            if not KNOWLEDGE_PAGE_ID.fullmatch(page_id) or page_id in RESERVED_KNOWLEDGE_PAGE_IDS:
+                continue
+            ids.append(page_id)
+        ids.sort()
+        items=[self._knowledge_page_metadata(project_id,pid,directory/f"{pid}.md") for pid in ids[offset:offset+limit]]
+        return {"project_id":project_id,"directory":"@memory/knowledge/","count":len(ids),"offset":offset,"limit":limit,
+                "next_offset":offset+len(items) if offset+len(items)<len(ids) else None,"unindexed_count":sum(not x["fresh"] for x in items),"pages":items}
+
+    def read_knowledge_page(self, project_id: str, page_id: str, max_chars: int = MAX_KNOWLEDGE_OUTPUT_CHARS, history_id: str = "") -> dict[str, Any]:
+        page_id=self._knowledge_page_id(page_id)
+        directory=self._knowledge_directory(project_id,create=False)
+        current=directory/f"{page_id}.md"
+        if history_id:
+            if not re.fullmatch(r"[0-9]{13}-[a-f0-9]{12}(?:-[a-f0-9]{8})?",history_id):
+                raise ValueError("history_id is malformed")
+            history_parent=directory/".history"
+            if history_parent.is_symlink() or getattr(history_parent,"is_junction",lambda:False)():
+                raise ValueError("Knowledge history cannot be a symlink or junction")
+            history_root=directory/".history"/page_id
+            if history_root.is_symlink() or getattr(history_root,"is_junction",lambda:False)():
+                raise ValueError("Knowledge history cannot be a symlink or junction")
+            if not history_root.is_dir(): raise ValueError("Knowledge history entry does not exist")
+            path=history_root/f"{history_id}.md"
+            if path.is_symlink() or getattr(path,"is_junction",lambda:False)() or not path.is_file() or path.resolve(strict=True).parent!=history_root.resolve(strict=True):
+                raise ValueError("Knowledge history entry does not exist or is unsafe")
+        else:
+            path=self._knowledge_page_path(project_id,page_id)
+            if not path.is_file(): raise ValueError(f"Unknown knowledge page {page_id!r}")
+        content=path.read_text(encoding="utf-8")
+        if len(content.encode("utf-8"))>MAX_KNOWLEDGE_PAGE_BYTES:
+            raise ValueError(f"Knowledge page exceeds the {MAX_KNOWLEDGE_PAGE_BYTES}-byte limit")
+        digest=hashlib.sha256(content.encode("utf-8")).hexdigest()
+        max_chars=min(max(int(max_chars),1000),MAX_KNOWLEDGE_OUTPUT_CHARS)
+        return {"project_id":project_id,"page_id":page_id,"history_id":history_id,"path":str(path) if history_id else f"@memory/knowledge/{page_id}.md",
+                "sha256":digest,"content":content[:max_chars],"content_truncated":len(content)>max_chars,"characters":len(content)}
+
+    def knowledge_page_history(self, project_id: str, page_id: str, limit: int = 20) -> dict[str, Any]:
+        page_id=self._knowledge_page_id(page_id)
+        if not 1<=limit<=50: raise ValueError("limit must be between 1 and 50")
+        history_parent=self._knowledge_directory(project_id,create=False)/".history"
+        if history_parent.is_symlink() or getattr(history_parent,"is_junction",lambda:False)():
+            raise ValueError("Knowledge history cannot be a symlink or junction")
+        directory=history_parent/page_id
+        if directory.is_symlink() or getattr(directory,"is_junction",lambda:False)():
+            raise ValueError("Knowledge history cannot be a symlink or junction")
+        entries=[]
+        if directory.exists():
+            for path in directory.glob("*.md"):
+                if path.is_symlink() or getattr(path,"is_junction",lambda:False)() or not path.is_file(): continue
+                if not re.fullmatch(r"[0-9]{13}-[a-f0-9]{12}(?:-[a-f0-9]{8})?",path.stem): continue
+                content=path.read_text(encoding="utf-8")
+                entries.append({"history_id":path.stem,"sha256":hashlib.sha256(content.encode("utf-8")).hexdigest(),"bytes":path.stat().st_size,"modified_at":path.stat().st_mtime})
+        entries.sort(key=lambda x:x["history_id"],reverse=True)
+        return {"project_id":project_id,"page_id":page_id,"history":entries[:limit],"history_truncated":len(entries)>limit}
+
+    def create_knowledge_page(self, project_id: str, page_id: str, title: str, content: str) -> dict[str, Any]:
+        page_id=self._knowledge_page_id(page_id)
+        title=title.strip()
+        if not title or "\n" in title or "\r" in title: raise ValueError("title must be a non-empty single line")
+        if not isinstance(content,str) or "\0" in content: raise ValueError("content must be Markdown text")
+        body=content.strip()
+        document=f"# {title}\n\n{body}\n"
+        if len(document.encode("utf-8"))>MAX_KNOWLEDGE_PAGE_BYTES: raise ValueError("knowledge page exceeds the 48000-byte limit")
+        path=self._knowledge_page_path(project_id,page_id,create_directory=False)
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if path.exists(): db.rollback(); raise ValueError("Knowledge page already exists; read it before updating")
+            self._atomic_markdown_write(path,document)
+            self._index_file(db,project_id,f"@memory/knowledge/{page_id}.md",path,time.time())
+            db.commit()
+        return self._knowledge_page_metadata(project_id,page_id,path)|{"created":True,"source_revision":self.source_revision(project_id)}
+
+    def update_knowledge_page(self, project_id: str, page_id: str, content: str, expected_sha256: str) -> dict[str, Any]:
+        page_id=self._knowledge_page_id(page_id)
+        if not expected_sha256 or not re.fullmatch(r"[a-f0-9]{64}",expected_sha256): raise ValueError("expected_sha256 from knowledge read is required")
+        if not isinstance(content,str) or "\0" in content or not content.lstrip().startswith("# "):
+            raise ValueError("content must be Markdown beginning with a level-one heading")
+        if len(content.encode("utf-8"))>MAX_KNOWLEDGE_PAGE_BYTES: raise ValueError("knowledge page exceeds the 48000-byte limit")
+        path=self._knowledge_page_path(project_id,page_id)
+        if not path.is_file(): raise ValueError(f"Unknown knowledge page {page_id!r}")
+        history_parent=path.parent/".history"
+        if history_parent.is_symlink() or getattr(history_parent,"is_junction",lambda:False)(): raise ValueError("Knowledge history cannot be a symlink or junction")
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current=path.read_text(encoding="utf-8")
+            current_hash=hashlib.sha256(current.encode("utf-8")).hexdigest()
+            if current_hash!=expected_sha256: db.rollback(); raise ValueError("Knowledge page changed since it was read; reread before updating")
+            if hashlib.sha256(content.encode("utf-8")).hexdigest()==current_hash:
+                db.commit(); return self._knowledge_page_metadata(project_id,page_id,path)|{"updated":False,"source_revision":self.source_revision(project_id)}
+            history_dir=history_parent/page_id
+            if history_dir.exists() and (history_dir.is_symlink() or getattr(history_dir,"is_junction",lambda:False)() or not history_dir.is_dir()):
+                db.rollback(); raise ValueError("Knowledge history path is unsafe")
+            history_dir.mkdir(parents=True,exist_ok=True)
+            history_id=f"{int(time.time()*1000)}-{current_hash[:12]}"
+            backup=history_dir/f"{history_id}.md"
+            if backup.exists(): history_id+=f"-{uuid.uuid4().hex[:8]}"; backup=history_dir/f"{history_id}.md"
+            self._atomic_markdown_write(backup,current)
+            self._atomic_markdown_write(path,content)
+            indexed=self._index_file(db,project_id,f"@memory/knowledge/{page_id}.md",path,time.time())
+            db.commit()
+        return self._knowledge_page_metadata(project_id,page_id,path)|{"updated":True,"history_id":history_id,"prior_sha256":current_hash,"indexed":True,"content_changed":indexed,"source_revision":self.source_revision(project_id)}

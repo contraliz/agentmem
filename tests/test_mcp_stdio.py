@@ -22,10 +22,23 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
         async with Client(params,read_timeout_seconds=20) as client:
             tools=await client.list_tools()
             names={tool.name for tool in tools.tools}
-            assert {"projects","attach_project","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","export_project"}.issubset(names)
+            assert {"projects","attach_project","knowledge","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","export_project"}.issubset(names)
             assert all(not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",tool.description or "",re.I) for tool in tools.tools)
             result=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
             assert result.structured_content["id"]=="pilot"
+            page_list=await client.call_tool("knowledge",{"action":"list","project_id":"pilot"})
+            assert page_list.structured_content["count"]==5
+            page=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"purpose"})
+            assert page.structured_content["content"].startswith("# Purpose and scope")
+            created_page=await client.call_tool("knowledge",{"action":"create","project_id":"pilot","page_id":"mcp-notes","title":"MCP notes","content":"A unique evidence token confirms immediate indexing."})
+            assert created_page.structured_content["fresh"] is True
+            page_hit=await client.call_tool("retrieve_evidence",{"project_id":"pilot","query":"unique evidence token"})
+            assert page_hit.structured_content["results"][0]["citation"].startswith("@memory/knowledge/mcp-notes.md#L1-")
+            page_content=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"mcp-notes"})
+            updated_page=await client.call_tool("knowledge",{"action":"update","project_id":"pilot","page_id":"mcp-notes","expected_sha256":page_content.structured_content["sha256"],"content":"# MCP notes\n\nAn updated unique evidence token with a verified revision.\n"})
+            assert updated_page.structured_content["updated"] is True and updated_page.structured_content["fresh"] is True
+            history=await client.call_tool("knowledge",{"action":"history","project_id":"pilot","page_id":"mcp-notes"})
+            assert len(history.structured_content["history"])==1
             brief=await client.call_tool("update_project_brief",{"project_id":"pilot","markdown":"# Pilot memory\nThis brief is stored outside the source repository.\n"})
             assert brief.structured_content["path"]==str(tmp_path/"project-kbs"/"pilot"/"PROJECT.md")
             assert not (project/".agentmem"/"PROJECT.md").exists()
@@ -39,7 +52,9 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert attached.structured_content["project"]["id"]=="pilot"
             assert len(str(attached.structured_content))<6500
             assert attached.structured_content["indexed_sources"]==[]
-            assert attached.structured_content["indexed_source_count"]==2
+            assert attached.structured_content["indexed_source_count"]==10
+            assert attached.structured_content["knowledge_pages"]["count"]==6
+            assert "No source files have been indexed yet." not in attached.structured_content["unknowns"]
             assert not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",str(attached.structured_content),re.I)
             started=time.perf_counter()
             query=await client.call_tool("retrieve_evidence",{"project_id":"pilot","query":"MCP server"})
@@ -54,7 +69,10 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert combined_evidence["results"][0]["citation"].startswith("README.md#L1-")
             assert combined_evidence["results"][0]["fresh"] is True
             manifest=await client.call_tool("attach_project",{"project_id":"pilot","include_sources":True})
-            assert {item["path"] for item in manifest.structured_content["indexed_sources"]}=={"README.md","@memory/PROJECT.md"}
+            assert {item["path"] for item in manifest.structured_content["indexed_sources"]}=={
+                "README.md","@memory/PROJECT.md","@memory/requirements.md","@memory/decisions.md",
+                *{f"@memory/knowledge/{page_id}.md" for page_id in ("purpose","architecture","risks","history","materials","mcp-notes")},
+            }
             other=tmp_path/"other"; other.mkdir(); (other/"README.md").write_text("completely unrelated notes",encoding="utf-8")
             await client.call_tool("projects",{"action":"register","project_id":"other","root":str(other)})
             await client.call_tool("index_project",{"project_id":"other"})
@@ -102,7 +120,8 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             req_receipt=await client.call_tool("record_work",{"action":"receipt","project_id":"pilot","task_id":req_task.structured_content["id"],"owner":"mcp-test","lease_token":req_claim.structured_content["lease_token"],"idempotency_key":"mcp-requirement-receipt","receipt":{"status":"done","requirements_revision":req_packet["requirements_revision"],"requirement_checks":[{"requirement_id":rid,"revision":current_req["revision"],"met":True,"evidence":"asserted cited output"}],"acceptance_checks":[{"criterion":"test passes","met":True,"evidence":"MCP end-to-end test passed"}]}})
             assert req_receipt.structured_content["status"]=="done"
             exports=await client.call_tool("export_project",{"project_id":"pilot"})
-            assert exports.structured_content["schema_version"]==2 and exports.structured_content["requirements"] and exports.structured_content["decisions"]
+            assert exports.structured_content["schema_version"]==3 and exports.structured_content["requirements"] and exports.structured_content["decisions"]
+            assert exports.structured_content["knowledge_manifest"]["page_count"]==6
             assert attach_ms<2000 and search_ms<2000
             print(f"stdio probe attach_ms={attach_ms:.1f} search_ms={search_ms:.1f} combined_attach_query_ms={combined_ms:.1f}")
 

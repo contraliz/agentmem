@@ -24,6 +24,7 @@ def main() -> None:
     p=sub.add_parser("index"); p.add_argument("project_id"); p.add_argument("--max-files",type=int,default=5000)
     p=sub.add_parser("check"); p.add_argument("project_id"); p.add_argument("--max-files",type=int,default=5000)
     p=sub.add_parser("search"); p.add_argument("project_id"); p.add_argument("query"); p.add_argument("--limit",type=int,default=5)
+    p=sub.add_parser("knowledge",help="manage project-scoped Markdown knowledge pages"); p.add_argument("action",choices=["init","list","read","create","update","history"]); p.add_argument("project_id"); p.add_argument("--id",default=""); p.add_argument("--title",default=""); p.add_argument("--content",default=""); p.add_argument("--expected-sha256",default=""); p.add_argument("--history-id",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--offset",type=int,default=0); p.add_argument("--max-chars",type=int,default=12000)
     p=sub.add_parser("task"); p.add_argument("action",choices=["create","list","show","update"]); p.add_argument("project_id"); p.add_argument("--id",default=""); p.add_argument("--title",default=""); p.add_argument("--goal",default=""); p.add_argument("--acceptance",action="append",default=None); p.add_argument("--depends-on",action="append",default=None); p.add_argument("--authorized-path",action="append",default=None); p.add_argument("--blocked-reason",default=None); p.add_argument("--priority",type=int,default=None); p.add_argument("--status",default="all")
     p.add_argument("--component",action="append",default=None); p.add_argument("--requirement-id",action="append",default=None)
     p=sub.add_parser("task-context",help="show task packet including applicable requirements"); p.add_argument("project_id"); p.add_argument("--id",required=True); p.add_argument("--max-chars",type=int,default=12000); p.add_argument("--requirement-offset",type=int,default=0); p.add_argument("--requirements-limit",type=int,default=12)
@@ -40,6 +41,13 @@ def main() -> None:
         elif args.command=="index": result=store.index_project(args.project_id,args.max_files)
         elif args.command=="check": result=store.check_project_changes(args.project_id,args.max_files)
         elif args.command=="search": result=store.search(args.project_id,args.query,args.limit)
+        elif args.command=="knowledge":
+            if args.action=="init": result=store.initialize_knowledge(args.project_id)
+            elif args.action=="list": result=store.list_knowledge_pages(args.project_id,args.limit,args.offset)
+            elif args.action=="read": result=store.read_knowledge_page(args.project_id,args.id,args.max_chars,args.history_id)
+            elif args.action=="create": result=store.create_knowledge_page(args.project_id,args.id,args.title,args.content)
+            elif args.action=="update": result=store.update_knowledge_page(args.project_id,args.id,args.content,args.expected_sha256)
+            else: result=store.knowledge_page_history(args.project_id,args.id,args.limit)
         elif args.command=="task":
             if args.action=="create": result=store.create_task(args.project_id,args.title,args.goal,args.acceptance or [],args.priority or 3,args.depends_on,args.authorized_path,args.blocked_reason or "",args.component,args.requirement_id)
             elif args.action=="list": result={"tasks":store.list_tasks(args.project_id,args.status)}

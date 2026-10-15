@@ -55,7 +55,8 @@ def test_incremental_index_excludes_secrets_and_symlinks(setup):
     (root/"credentials.json").write_text("alpha credential",encoding="utf-8")
     (root/"node_modules").mkdir(); (root/"node_modules"/"lib.md").write_text("alpha ignored",encoding="utf-8")
     first=store.index_project("p"); second=store.index_project("p")
-    assert first["files_changed"]==2
+    # A newly registered project includes safe, intentionally empty KB scaffolds.
+    assert first["files_changed"]==9
     assert second["files_changed"]==0
     result=store.search("p","alpha")
     assert len(result["results"])==1 and result["results"][0]["citation"].startswith("guide.md#L")
@@ -66,10 +67,10 @@ def test_generated_egg_info_is_excluded_from_index_and_freshness(setup):
     store,root,_=setup
     generated=root/"src"/"sample.egg-info"
     generated.mkdir(parents=True)
-    (generated/"SOURCES.txt").write_text("noise from generated build metadata",encoding="utf-8")
+    (generated/"SOURCES.txt").write_text("EGG_INFO_SECRET_CANARY_ZZ",encoding="utf-8")
     (root/"guide.md").write_text("the project answer is grounded in this guide",encoding="utf-8")
     store.index_project("p")
-    assert store.search("p","generated build metadata")["results"] == []
+    assert store.search("p","EGG_INFO_SECRET_CANARY_ZZ")["results"] == []
     assert not any(".egg-info" in path for path in store.check_project_changes("p")["new_paths"])
 
 
@@ -86,10 +87,13 @@ def test_attach_can_bundle_focused_cited_question_evidence(setup):
     assert evidence["results"][0]["excerpt_truncated"] is True
     plain=store.attach("p")
     assert "question_context" not in plain
-    assert plain["indexed_sources"]==[] and plain["indexed_source_count"]==2
+    assert plain["indexed_sources"]==[] and plain["indexed_source_count"]==9
     assert plain["source_manifest_included"] is False
     detailed=store.attach("p",include_sources=True)
-    assert {item["path"] for item in detailed["indexed_sources"]}=={"guide.md","@memory/PROJECT.md"}
+    assert {item["path"] for item in detailed["indexed_sources"]}=={
+        "guide.md","@memory/PROJECT.md","@memory/requirements.md","@memory/decisions.md",
+        *{f"@memory/knowledge/{page_id}.md" for page_id in ("purpose","architecture","risks","history","materials")},
+    }
     compact=store.attach("p",max_chars=1000,query="retry limit")
     assert len(json.dumps(compact,ensure_ascii=False,separators=(",",":")))<=1000
     if compact.get("question_context",{}).get("results"):
@@ -281,8 +285,8 @@ def test_project_brief_is_written_only_to_external_knowledge_directory(setup):
     assert Path(result["path"])==store.memory_root/"p"/"PROJECT.md"
     assert Path(result["path"]).read_text(encoding="utf-8").startswith("# Updated")
     assert old.read_text(encoding="utf-8")=="old source copy"
-    assert "@memory/PROJECT.md" in store.check_project_changes("p")["changed_paths"]
-    store.index_project("p")
+    assert result["indexed"] is True
+    assert "@memory/PROJECT.md" not in store.check_project_changes("p")["changed_paths"]
     hit=store.search("p","External project knowledge")["results"][0]
     assert hit["citation"].startswith("@memory/PROJECT.md#L") and hit["fresh"] is True
 
@@ -434,7 +438,8 @@ def test_restart_persistence_and_export(setup):
     restored=MemoryStore(data)
     assert restored.get_task("p",task["id"])["title"]=="persist"
     exported=restored.export_project("p")
-    assert exported["schema_version"]==2 and exported["tasks"]
+    assert exported["schema_version"]==3 and exported["tasks"]
+    assert exported["knowledge_manifest"]["page_count"]==5
     with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==5
 
 

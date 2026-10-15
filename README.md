@@ -4,7 +4,7 @@ Agent Memory is a local, project-scoped context and work-tracking module for Cod
 
 ## Ready to use here
 
-This workspace is installed in a local Python environment and registered in Codex as the stdio MCP server `agentmem`. The small locator registry and migration backups stay in `[local path redacted]\.agentmem-data`; each project's active SQLite store and `PROJECT.md` live in its own knowledge directory under `D:\projects`.
+This workspace is installed in a local Python environment and registered in Codex as the stdio MCP server `agentmem`. The small locator registry and migration backups stay in `[local path redacted]\.agentmem-data`; each project's active SQLite store and Markdown knowledge pages live in its own knowledge directory under `D:\projects`.
 
 The Agent Memory project uses `[local path redacted]` and keeps the original source root at `[local path redacted]`. <redacted-private-value> uses `[local path redacted]` and keeps its source root at `[local path redacted]`. The <redacted-private-value> move preserved only its preexisting AgentMem records; no source repository or vault content was copied or indexed. The old shared database was backed up and marked retired. Open a fresh Codex chat/session to make sure it launches the updated server. Data is local; no API key is needed.
 
@@ -36,7 +36,9 @@ Merge [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) into that project
 
 ## Storage layout and migration
 
-`D:\projects\<project_id>\agentmem.sqlite3` is authoritative for that project's tasks, dependencies, claims/checkpoints, receipts, lessons, source hashes, and FTS evidence index. `D:\projects\<project_id>\PROJECT.md` is the curated human-readable brief. `D:\projects\<project_id>\.agentmem-project.json` identifies the KB and source root. The app registry contains only project ID, source root, description, and KB path so it can route requests. Source files stay in their original repositories; the index stores cited text excerpts and hashes, not copies of those repositories.
+`D:\projects\<project_id>\agentmem.sqlite3` is authoritative for that project's tasks, dependencies, claims/checkpoints, receipts, lessons, requirements/decisions and histories, source hashes, and FTS evidence index. `D:\projects\<project_id>\PROJECT.md` is a compact brief and navigation page. Detailed narrative lives in `D:\projects\<project_id>\knowledge\` (purpose, architecture, risks, history, and materials by default). `D:\projects\<project_id>\requirements.md` and `decisions.md` are generated views of SQLite records; do not create editable duplicates in topic pages. `D:\projects\<project_id>\.agentmem-project.json` identifies the KB and source root. The app registry contains only project ID, source root, description, and KB path so it can route requests. Source files stay in their original repositories; the index stores cited text excerpts and hashes, not copies of those repositories.
+
+New registrations create five empty topic pages with “Not documented yet” placeholders and a linked brief; they do not invent project facts. For a previously registered project without a `knowledge` directory, run `knowledge init <project_id>`. It only creates missing pages and preserves the existing brief and pages. Review and add brief navigation separately with `update_project_brief` if needed.
 
 Before opening a per-project database, the server checks the knowledge-directory manifest and source-root binding. It rejects missing stores, mismatched project identity, and knowledge directories/databases replaced by symlinks or junctions.
 
@@ -47,12 +49,15 @@ On first startup after the upgrade, AgentMem makes a WAL-consistent backup of th
 Try prompts like:
 
 - “Attach to the `agentmem` project and explain what this module does. Cite the project files you used, and tell me what is not indexed or known.”
+- “Attach to `agentmem`, show the topic-page inventory, then read the architecture and risks pages. Explain how project facts are stored and cite the relevant lines.”
 - “For project `sunflower`, what are the current API constraints? Attach the project with this question and answer from its cited evidence.”
 - “For project `sunflower`, add a task to verify the controller change. Set acceptance criteria, authorized paths, and relevant dependencies. Do not start it yet.”
 - “For `agentmem`, list ready and blocked tasks. Claim the top ready task as `codex-main`, inspect its context and applicable lessons, then continue working. Save a checkpoint before a long investigation and record an evidence-backed receipt afterward.”
 - “Propose a lesson from this task, but keep it a candidate until we review its scope and evidence.”
 
 For a quick factual answer, call `attach_project` once with both `project_id` and `query`. It returns the usual project brief/tasks/lessons/freshness context plus up to three focused evidence excerpts with path/line/hash citations. This combines the usual attach and search round trips; the server still does not generate the answer. The full source manifest is omitted from the normal packet to save context; it includes the total source count and revision, while cited results carry their own source hashes. Pass `include_sources=true` when you need the detailed manifest. Use `retrieve_evidence` for a broader or deeper search. A plain `attach_project` call remains the orientation path when there is no question. Attach performs a metadata-only scan (path, modification time, and size) to flag likely changed/new/deleted files without reading their contents. Call `index_project` after edits to hash content and refresh citations; there is no background watcher. `task_context` reports indexed revision differences and the metadata scan, so the agent can request a refresh before relying on changed files. A checkpoint's source revision is a snapshot, not proof that files never changed.
+
+`attach_project` also returns a small inventory of the topic pages and whether each page matches its indexed hash; it does not include all page contents. Use `knowledge(action="list")` and `knowledge(action="read", page_id="architecture")` to open the relevant page. `knowledge(action="create")` and `knowledge(action="update")` write only validated Markdown pages under that project's `knowledge/` directory and immediately update that page's search index. Updates require the SHA-256 returned by `read`, and the service saves the prior version under `knowledge/.history/`; those snapshots are excluded from search. Direct editor changes remain allowed but must be refreshed with `index_project` before relying on citations. No page-delete tool is provided.
 
 The todo flow is `tasks(action="create"|"list"|"show"|"update")` → `claim_task` → `task_context` → `record_work(action="checkpoint")` as needed → `record_work(action="receipt")`. `task_context` bundles the task scope/checkpoint, relevant accepted lessons, matching source evidence, and whether the indexed source revision changed since task creation. Update only applies to open, unclaimed tasks. Before resuming, call `index_project` if you need to detect recent file edits. The agent holding the lease may call `record_work(action="block", blocked_reason="...")` and later `record_work(action="unblock")`. Ready status is derived from dependencies and explicit blockers. Task claims use a lease and unique token; keep the token returned by `claim_task` for subsequent updates. Done is accepted only when every listed acceptance check has `met: true` and evidence. Claims expire and may then be recovered. The memory service records task state; the active agent carries out the project work.
 
@@ -86,7 +91,7 @@ task_context(project_id="sunflower", task_id="...")
 
 When recording completion, include the `requirements_revision` returned by `task_context`, and a `requirement_checks` entry for each applicable requirement with its ID, revision, `met=true`, and evidence. This check means the agent reviewed and complied with the requirement in this task; it does not claim the requirement is globally fulfilled. The usual task acceptance checks still apply. The receipt does not automatically mark a requirement fulfilled; record that explicitly with `requirements(action="fulfill", expected_revision=..., fulfillment="fulfilled", fulfillment_evidence=[...], idempotency_key=...)` only when the evidence warrants it. Create a replacement with `supersedes_id` before marking the previous requirement superseded. Use `requirements(action="history")` or `decisions(action="history")` to inspect prior revisions. If a generated `requirements.md` or `decisions.md` was manually edited, `sync` reports a conflict; use `sync(force=true)` only after deciding to preserve the file's edits in the automatic backup.
 
-Structured records and complete revision history live in that project's SQLite DB. The readable `requirements.md` and `decisions.md` files are generated views. Their projection files are not independent authorities; use the MCP/CLI to change them. SQLite updates use stable IDs, expected revisions and idempotency keys to surface conflicting writes. Schema v4 upgrades an existing v3 project database additively; schema v5 adds a guard that blocks old-style task completion receipts that omit the current requirements revision. Restart Codex to load the updated MCP tools and scoped checks. Exports use schema version 2 and include record history.
+Structured records and complete revision history live in that project's SQLite DB. The readable `requirements.md` and `decisions.md` files are generated views. Their projection files are not independent authorities; use the MCP/CLI to change them. SQLite updates use stable IDs, expected revisions and idempotency keys to surface conflicting writes. Schema v4 upgrades an existing v3 project database additively; schema v5 adds a guard that blocks old-style task completion receipts that omit the current requirements revision. Restart Codex to load the updated MCP tools and scoped checks. Exports use schema version 3 and include record history plus a path/hash manifest for Markdown topic pages. The actual Markdown files remain in the project KB; copy those files alongside an export for a complete file backup.
 
 ## CLI
 
@@ -104,7 +109,13 @@ Structured records and complete revision history live in that project's SQLite D
 & '[local path redacted]\agentmem.ps1' task-context sunflower --id '<TASK_ID>'
 & '[local path redacted]\agentmem.ps1' decision list sunflower
 & '[local path redacted]\agentmem.ps1' decision history sunflower --id DEC-0001
+& '[local path redacted]\agentmem.ps1' knowledge init sunflower
+& '[local path redacted]\agentmem.ps1' knowledge list sunflower
+& '[local path redacted]\agentmem.ps1' knowledge read sunflower --id architecture
+& '[local path redacted]\agentmem.ps1' knowledge history sunflower --id architecture
 ```
+
+To add a page, supply a lowercase slug, title, and body text: `knowledge create sunflower --id deployment --title 'Deployment' --content 'Document the verified deployment path.'`. To revise one, read it first and pass its current hash: `knowledge update sunflower --id deployment --expected-sha256 '<SHA256_FROM_READ>' --content "# Deployment`n`nUpdated verified deployment notes."`. A revision conflict means reread the page and reconcile the change before trying again. Use a normal single-line slug; file paths are not accepted by the page API.
 
 ## Safety and limits
 
