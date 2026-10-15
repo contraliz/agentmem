@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import multiprocessing
+import json
 import subprocess
 from pathlib import Path
 
@@ -89,6 +90,11 @@ def test_attach_can_bundle_focused_cited_question_evidence(setup):
     assert plain["source_manifest_included"] is False
     detailed=store.attach("p",include_sources=True)
     assert {item["path"] for item in detailed["indexed_sources"]}=={"guide.md","@memory/PROJECT.md"}
+    compact=store.attach("p",max_chars=1000,query="retry limit")
+    assert len(json.dumps(compact,ensure_ascii=False,separators=(",",":")))<=1000
+    if compact.get("question_context",{}).get("results"):
+        assert compact["question_context"]["results"][0]["citation"].startswith("guide.md#L")
+        assert compact["question_context"]["results"][0]["excerpt_truncated"] is True
 
 
 def test_index_rejects_symlink_escape(setup, tmp_path):
@@ -428,8 +434,8 @@ def test_restart_persistence_and_export(setup):
     restored=MemoryStore(data)
     assert restored.get_task("p",task["id"])["title"]=="persist"
     exported=restored.export_project("p")
-    assert exported["schema_version"]==1 and exported["tasks"]
-    with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==2
+    assert exported["schema_version"]==2 and exported["tasks"]
+    with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==5
 
 
 def test_task_context_is_bounded_and_reports_indexed_revision_change(setup):

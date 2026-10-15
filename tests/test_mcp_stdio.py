@@ -22,7 +22,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
         async with Client(params,read_timeout_seconds=20) as client:
             tools=await client.list_tools()
             names={tool.name for tool in tools.tools}
-            assert {"projects","attach_project","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","export_project"}.issubset(names)
+            assert {"projects","attach_project","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","export_project"}.issubset(names)
             assert all(not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",tool.description or "",re.I) for tool in tools.tools)
             result=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
             assert result.structured_content["id"]=="pilot"
@@ -83,6 +83,26 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert (await client.call_tool("tasks",{"action":"show","project_id":"pilot","task_id":second.structured_content["id"]})).structured_content["ready"] is True
             exported=await client.call_tool("export_project",{"project_id":"pilot"})
             assert exported.structured_content["lesson_uses"]
+            requirement=await client.call_tool("requirements",{"action":"create","project_id":"pilot","title":"Keep sources cited","statement":"Factual project answers must cite source lines.","lifecycle":"current","fulfillment":"unknown","scope":{"project_wide":True},"original_quote":"Cite the sources.","source_type":"user_conversation","source_ref":"stdio test","idempotency_key":"stdio-req"})
+            rid=requirement.structured_content["id"]
+            assert rid.startswith("REQ-")
+            listed=await client.call_tool("requirements",{"action":"list","project_id":"pilot","lifecycle":"current"})
+            assert any(item["id"]==rid for item in listed.structured_content["requirements"])
+            fulfilled=await client.call_tool("requirements",{"action":"fulfill","project_id":"pilot","requirement_id":rid,"expected_revision":1,"idempotency_key":"stdio-req-fulfill","fulfillment":"fulfilled","fulfillment_evidence":["stdio integration assertion"]})
+            assert fulfilled.structured_content["fulfillment"]=="fulfilled" and fulfilled.structured_content["lifecycle"]=="current"
+            decision=await client.call_tool("decisions",{"action":"create","project_id":"pilot","title":"Use evidence first","choice":"Return excerpts and let Codex answer.","requirement_ids":[rid],"source_type":"test","source_ref":"stdio","idempotency_key":"stdio-decision"})
+            assert decision.structured_content["requirement_ids"]==[rid]
+            req_task=await client.call_tool("tasks",{"action":"create","project_id":"pilot","title":"Test requirement checks","goal":"Verify source citations","acceptance":["test passes"],"requirement_ids":[rid]})
+            req_context=await client.call_tool("task_context",{"project_id":"pilot","task_id":req_task.structured_content["id"]})
+            req_packet=req_context.structured_content["requirements"]
+            assert any(item["id"]==rid for item in req_packet["applicable_requirements"])
+            assert req_packet["requirements_revision"]>=1
+            req_claim=await client.call_tool("claim_task",{"project_id":"pilot","task_id":req_task.structured_content["id"],"owner":"mcp-test"})
+            current_req=next(item for item in req_packet["applicable_requirements"] if item["id"]==rid)
+            req_receipt=await client.call_tool("record_work",{"action":"receipt","project_id":"pilot","task_id":req_task.structured_content["id"],"owner":"mcp-test","lease_token":req_claim.structured_content["lease_token"],"idempotency_key":"mcp-requirement-receipt","receipt":{"status":"done","requirements_revision":req_packet["requirements_revision"],"requirement_checks":[{"requirement_id":rid,"revision":current_req["revision"],"met":True,"evidence":"asserted cited output"}],"acceptance_checks":[{"criterion":"test passes","met":True,"evidence":"MCP end-to-end test passed"}]}})
+            assert req_receipt.structured_content["status"]=="done"
+            exports=await client.call_tool("export_project",{"project_id":"pilot"})
+            assert exports.structured_content["schema_version"]==2 and exports.structured_content["requirements"] and exports.structured_content["decisions"]
             assert attach_ms<2000 and search_ms<2000
             print(f"stdio probe attach_ms={attach_ms:.1f} search_ms={search_ms:.1f} combined_attach_query_ms={combined_ms:.1f}")
 

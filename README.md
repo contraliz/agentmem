@@ -58,6 +58,36 @@ The todo flow is `tasks(action="create"|"list"|"show"|"update")` → `claim_task
 
 Lessons use `lessons(action="propose")`, `lessons(action="review", status="accepted"|"rejected"|"superseded")`, and `lessons(action="retrieve")`. Only accepted lessons are returned for application. Receipts and lesson evidence should cite source paths, test outputs, decisions, or changed artifacts. The module never automatically treats generated claims as project facts.
 
+## Requirements and decisions
+
+Record a durable user instruction before doing substantial work. Keep the user's short wording and source reference; distinguish the normalized statement from any agent interpretation. Use `lifecycle="proposed"` for uncertain interpretations until confirmed. The service does not see every conversation message, so it cannot automatically capture all requirements.
+
+Requirement `lifecycle` governs whether it applies (`proposed`, `current`, `superseded`, `withdrawn`); `fulfillment` records progress (`unknown`, `unmet`, `in_progress`, `fulfilled`, `regressed`, `waived`). These are independent: a completed task does not deactivate its requirement, and a fulfilled current requirement remains in applicable task context. Supersede or withdraw explicitly; a conditional requirement stops matching only when its condition is explicitly set inactive. `task_context` returns all matched current requirements, including fulfilled ones, separately from optional evidence and lessons. It reports total count and pagination; retrieve all pages if `requirements_complete` is false.
+
+Example MCP flow:
+
+```text
+requirements(action="create", project_id="sunflower", title="Keep public API stable",
+  statement="Do not remove existing public methods without explicit approval.",
+  original_quote="Keep the existing public API compatible.",
+  interpretation="A breaking removal needs approval; additions are allowed.",
+  lifecycle="current", fulfillment="unknown",
+  scope={"project_wide":true}, source_type="user_conversation",
+  source_ref="current Codex conversation", idempotency_key="capture-api-rule-01")
+
+tasks(action="create", project_id="sunflower", title="Refactor controller",
+  goal="Improve controller internals without breaking the public API.",
+  components=["controller"], requirement_ids=["REQ-0001"],
+  acceptance=["tests pass", "existing API remains compatible"])
+
+claim_task(project_id="sunflower", task_id="...", owner="codex-main")
+task_context(project_id="sunflower", task_id="...")
+```
+
+When recording completion, include the `requirements_revision` returned by `task_context`, and a `requirement_checks` entry for each applicable requirement with its ID, revision, `met=true`, and evidence. This check means the agent reviewed and complied with the requirement in this task; it does not claim the requirement is globally fulfilled. The usual task acceptance checks still apply. The receipt does not automatically mark a requirement fulfilled; record that explicitly with `requirements(action="fulfill", expected_revision=..., fulfillment="fulfilled", fulfillment_evidence=[...], idempotency_key=...)` only when the evidence warrants it. Create a replacement with `supersedes_id` before marking the previous requirement superseded. Use `requirements(action="history")` or `decisions(action="history")` to inspect prior revisions. If a generated `requirements.md` or `decisions.md` was manually edited, `sync` reports a conflict; use `sync(force=true)` only after deciding to preserve the file's edits in the automatic backup.
+
+Structured records and complete revision history live in that project's SQLite DB. The readable `requirements.md` and `decisions.md` files are generated views. Their projection files are not independent authorities; use the MCP/CLI to change them. SQLite updates use stable IDs, expected revisions and idempotency keys to surface conflicting writes. Schema v4 upgrades an existing v3 project database additively; schema v5 adds a guard that blocks old-style task completion receipts that omit the current requirements revision. Restart Codex to load the updated MCP tools and scoped checks. Exports use schema version 2 and include record history.
+
 ## CLI
 
 ```powershell
@@ -68,6 +98,12 @@ Lessons use `lessons(action="propose")`, `lessons(action="review", status="accep
 & '[local path redacted]\agentmem.ps1' search sunflower 'controller API constraints'
 & '[local path redacted]\agentmem.ps1' task list sunflower
 & '[local path redacted]\agentmem.ps1' export sunflower > sunflower-agentmem-export.json
+& '[local path redacted]\agentmem.ps1' requirement create sunflower --title 'Keep API stable' --statement 'Do not remove public methods without approval.' --quote 'Keep the public API compatible.' --scope-json '{"project_wide":true}' --source-type user_conversation --source-ref 'current Codex conversation' --idempotency-key capture-api-01
+& '[local path redacted]\agentmem.ps1' requirement list sunflower --lifecycle current
+& '[local path redacted]\agentmem.ps1' requirement history sunflower --id REQ-0001
+& '[local path redacted]\agentmem.ps1' task-context sunflower --id '<TASK_ID>'
+& '[local path redacted]\agentmem.ps1' decision list sunflower
+& '[local path redacted]\agentmem.ps1' decision history sunflower --id DEC-0001
 ```
 
 ## Safety and limits
