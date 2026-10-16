@@ -48,6 +48,24 @@ def test_project_isolation_and_resolution(setup, tmp_path):
     assert not store.search("other","alpha")["results"]
 
 
+def test_new_project_registration_explains_scaffold_and_preserves_reused_kb(tmp_path):
+    root=tmp_path/"project"; root.mkdir()
+    store=MemoryStore(tmp_path/"state")
+    created=store.register_project("p",root,"new project")
+    assert created["onboarding"]["newly_registered"] is True
+    assert created["onboarding"]["state"]=="scaffold_only"
+    assert created["onboarding"]["curation_status"]=="not_started"
+    assert "empty scaffolding" in created["onboarding"]["message"]
+    assert any("index_project" in step for step in created["onboarding"]["next_steps"])
+    store.create_knowledge_page("p","verified-purpose","Verified purpose","Existing curated content.")
+
+    reused=store.register_project("p",root,"same project")
+    assert reused["onboarding"]["newly_registered"] is False
+    assert reused["onboarding"]["state"]=="existing_registration"
+    assert reused["onboarding"]["curation_status"]=="not_assessed"
+    assert store.read_knowledge_page("p","verified-purpose")["content"]=="# Verified purpose\n\nExisting curated content.\n"
+
+
 def test_incremental_index_excludes_secrets_and_symlinks(setup):
     store,root,_=setup
     (root/"guide.md").write_text("alpha useful evidence",encoding="utf-8")

@@ -20,18 +20,38 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
 
     async def exercise():
         async with Client(params,read_timeout_seconds=20) as client:
+            instructions=client.instructions or ""
+            handshake_guidance=instructions[:512]
+            assert "For a new KB" in handshake_guidance
+            assert "confirm its ID and source root" in handshake_guidance
+            assert "projects(action=register)" in handshake_guidance
+            assert "index safe files" in handshake_guidance
+            assert "cited evidence" in handshake_guidance and "report verified facts and gaps" in handshake_guidance
+            assert "Registration creates empty scaffolding, not verified knowledge" in handshake_guidance
             tools=await client.list_tools()
             names={tool.name for tool in tools.tools}
             assert {"projects","attach_project","knowledge","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","proposals","export_project"}.issubset(names)
             assert all(not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",tool.description or "",re.I) for tool in tools.tools)
+            projects_description=next(tool.description for tool in tools.tools if tool.name=="projects")
+            assert "For a new KB" in projects_description and "scaffolding only" in projects_description
             result=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
             assert result.structured_content["id"]=="pilot"
+            assert result.structured_content["root"]==str(project.resolve())
+            assert result.structured_content["memory_root"]==str(tmp_path/"project-kbs"/"pilot")
+            assert result.structured_content["onboarding"]["state"]=="scaffold_only"
+            assert result.structured_content["onboarding"]["newly_registered"] is True
+            assert result.structured_content["onboarding"]["curation_status"]=="not_started"
             page_list=await client.call_tool("knowledge",{"action":"list","project_id":"pilot"})
             assert page_list.structured_content["count"]==5
             page=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"purpose"})
             assert page.structured_content["content"].startswith("# Purpose and scope")
             created_page=await client.call_tool("knowledge",{"action":"create","project_id":"pilot","page_id":"mcp-notes","title":"MCP notes","content":"A unique evidence token confirms immediate indexing."})
             assert created_page.structured_content["fresh"] is True
+            reused=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
+            assert reused.structured_content["onboarding"]["state"]=="existing_registration"
+            assert reused.structured_content["onboarding"]["newly_registered"] is False
+            preserved=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"mcp-notes"})
+            assert "unique evidence token" in preserved.structured_content["content"]
             page_hit=await client.call_tool("retrieve_evidence",{"project_id":"pilot","query":"unique evidence token"})
             assert page_hit.structured_content["results"][0]["citation"].startswith("@memory/knowledge/mcp-notes.md#L1-")
             page_content=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"mcp-notes"})

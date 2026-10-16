@@ -643,7 +643,30 @@ class MemoryStore:
             self.sync_records_projection(project_id, "requirements")
             self.sync_records_projection(project_id, "decisions")
             self.sync_records_projection(project_id, "approvals")
-        return self.get_project(project_id)
+        result = self.get_project(project_id)
+        result["onboarding"] = {
+            "newly_registered": created,
+            "state": "scaffold_only" if created else "existing_registration",
+            "curation_status": "not_started" if created else "not_assessed",
+            "message": (
+                "The new KB contains empty scaffolding only; no project facts have been verified."
+                if created else
+                "This registered project and KB binding already exist. Inspect their current context and freshness before deciding whether setup work is needed."
+            ),
+            "next_steps": (
+                [
+                    "Confirm the returned source root and knowledge directory match the intended project.",
+                    "Call index_project to index supported, safe source and KB text files.",
+                    "Call attach_project or retrieve_evidence and inspect cited source passages before writing project context.",
+                    "Curate PROJECT.md and focused knowledge pages; preserve explicit user requirements/decisions and label interpretations and unknowns honestly.",
+                    "Report what was verified, what is still missing, and unsupported material such as PDFs or binaries."
+                ] if created else [
+                    "Call attach_project and inspect the page inventory and source freshness.",
+                    "Index only if evidence is absent or sources changed; preserve existing project context and pages."
+                ]
+            )
+        }
+        return result
 
     def _valid_id(self, value: str) -> str:
         value = value.strip()

@@ -59,6 +59,8 @@ Current status is separate from historical existence. A content edit or any pinn
 
 ## MCP tool catalog
 
+The MCP initialization instructions provide a short cross-tool onboarding workflow. `projects(action="register")` adds an `onboarding` result that distinguishes a newly created `scaffold_only` KB from an `existing_registration`; the status is descriptive and does not claim that an existing KB is complete. New registration returns the confirmed source and knowledge roots plus next steps to index supported files, inspect cited evidence, curate focused pages, and report gaps. The server does not invoke an LLM or infer project facts. Existing project bindings and KB contents are preserved, and conflicting ID/root bindings fail.
+
 | Tool | Purpose |
 |---|---|
 | `projects` | List/register/resolve source roots and isolated knowledge-directory locations |
