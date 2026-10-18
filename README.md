@@ -4,16 +4,16 @@ Agent Memory is a local, project-scoped context and work-tracking module for Cod
 
 ## Ready to use here
 
-This workspace is installed in a local Python environment and registered in Codex as the stdio MCP server `agentmem`. The small locator registry and migration backups stay in `[local path redacted]\.agentmem-data`; each project's active SQLite store and Markdown knowledge pages live in its own knowledge directory under `D:\projects`.
+Install AgentMem in a local Python environment and register it in Codex as the stdio MCP server `agentmem`. Its locator registry and migration backups stay in the ignored `.agentmem-data` directory; each project's active SQLite store and Markdown knowledge pages live in its own knowledge directory.
 
-The Agent Memory project uses `[local path redacted]` and keeps the original source root at `[local path redacted]`. <redacted-private-value> uses `[local path redacted]` and keeps its source root at `[local path redacted]`. The <redacted-private-value> move preserved only its preexisting AgentMem records; no source repository or vault content was copied or indexed. The old shared database was backed up and marked retired. Open a fresh Codex chat/session to make sure it launches the updated server. Data is local; no API key is needed.
+Each registered project keeps its source repository in its original location and stores its AgentMem knowledge separately. Migration preserves registered project records without copying source repositories or vault content. Data is local; no API key is needed.
 
 ## First setup on this PC or another checkout
 
 From PowerShell:
 
 ```powershell
-cd [local path redacted]
+Set-Location <path-to-agentmem-checkout>
 .\scripts\setup.ps1
 .\scripts\install-codex.ps1
 ```
@@ -23,9 +23,9 @@ Restart/open a Codex session, then check `codex mcp list`. The install script re
 To register another project, use this workspace's stable CLI wrapper from any directory:
 
 ```powershell
-& '[local path redacted]\agentmem.ps1' project register --id sunflower --root '<local-path>' --description 'Sunflower project'
-& '[local path redacted]\agentmem.ps1' index sunflower
-& '[local path redacted]\agentmem.ps1' attach sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' project register --id sunflower --root '<path-to-sunflower-checkout>' --description 'Sunflower project'
+& '<path-to-agentmem-checkout>\agentmem.ps1' index sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' attach sunflower
 ```
 
 The default KB will be `D:\projects\sunflower`; pass `--memory-root '<local-path>'` after `register` for a custom location. A project ID cannot be silently rebound to another source root or memory directory.
@@ -34,7 +34,7 @@ When an agent starts a new KB through the MCP, it should first confirm the exact
 
 If the project owner wants persistent project-specific Codex guidance, review [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) and merge suitable instructions into that project's existing `AGENTS.md`; do not overwrite existing instructions. `update_project_brief` writes only to the AgentMem-owned `PROJECT.md` inside that project's registered knowledge directory; original source repositories are read for evidence and are never used as the KB storage location.
 
-`AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it defaults to `D:\projects` on Windows. `--data-dir` and `--memory-root` are also available in the CLI. The current Codex server environment points at the ignored workspace `.agentmem-data` registry. To inspect its command without revealing unrelated settings, run `codex mcp get agentmem`.
+`AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it defaults to `D:\projects` on Windows. `--data-dir` and `--memory-root` are also available in the CLI. To inspect the registered command, run `codex mcp get agentmem`.
 
 ## Storage layout and migration
 
@@ -44,7 +44,7 @@ New registrations create five empty topic pages with “Not documented yet” pl
 
 Before opening a per-project database, the server checks the knowledge-directory manifest and source-root binding. It rejects missing stores, mismatched project identity, and knowledge directories/databases replaced by symlinks or junctions.
 
-On first startup after the upgrade, AgentMem makes a WAL-consistent backup of the former shared database under `.agentmem-data\migration-backups`, copies and verifies every registered project's records into separate stores, then switches the locator registry. It retains the old database as a recovery copy with write guards on its relational tables. Those guards do not cover SQLite's FTS virtual table or an older server's direct file writes, so they are not a substitute for shutting down a pre-migration MCP process. After migration, restart Codex or open a new session to load the current server and tool definitions; do not continue using a stale MCP connection. During this migration, the nine identified old AgentMem server processes were stopped and verified absent. The original `[local path redacted]\.agentmem\PROJECT.md` remains untouched as a pre-migration copy; the authoritative brief is now `[local path redacted]\PROJECT.md`. For a custom KB location, set `AGENTMEM_MEMORY_ROOT` consistently for both MCP and CLI processes.
+On first startup after the upgrade, AgentMem makes a WAL-consistent backup of the former shared database under `.agentmem-data\migration-backups`, copies and verifies each registered project's records into separate stores, then switches the locator registry. It retains the old database as a recovery copy with write guards on its relational tables. Those guards do not cover SQLite's FTS virtual table or direct file writes from an older server, so shut down pre-migration MCP processes. After migration, restart Codex or open a new session to load the current server and tool definitions. For a custom KB location, set `AGENTMEM_MEMORY_ROOT` consistently for both MCP and CLI processes.
 
 ## Use it in Codex
 
@@ -124,28 +124,28 @@ Use `proposals(action="status"|"history"|"approval-history")` before work when t
 ## CLI
 
 ```powershell
-& '[local path redacted]\agentmem.ps1' project list
-& '[local path redacted]\agentmem.ps1' project resolve --cwd '<local-path>'
-& '[local path redacted]\agentmem.ps1' index sunflower
-& '[local path redacted]\agentmem.ps1' check sunflower
-& '[local path redacted]\agentmem.ps1' search sunflower 'controller API constraints'
-& '[local path redacted]\agentmem.ps1' task list sunflower
-& '[local path redacted]\agentmem.ps1' export sunflower > sunflower-agentmem-export.json
-& '[local path redacted]\agentmem.ps1' requirement create sunflower --title 'Keep API stable' --statement 'Do not remove public methods without approval.' --quote 'Keep the public API compatible.' --scope-json '{"project_wide":true}' --source-type user_conversation --source-ref 'current Codex conversation' --idempotency-key capture-api-01
-& '[local path redacted]\agentmem.ps1' requirement list sunflower --lifecycle current
-& '[local path redacted]\agentmem.ps1' requirement history sunflower --id REQ-0001
-& '[local path redacted]\agentmem.ps1' task-context sunflower --id '<TASK_ID>'
-& '[local path redacted]\agentmem.ps1' decision list sunflower
-& '[local path redacted]\agentmem.ps1' decision history sunflower --id DEC-0001
-& '[local path redacted]\agentmem.ps1' proposal create sunflower --title 'Controller rollout' --content 'Preserve the public API while replacing internals.' --targets-json '[{"kind":"requirement","id":"REQ-0001","revision":2}]' --approval-required --created-by codex-main --idempotency-key rollout-draft-1
-& '[local path redacted]\agentmem.ps1' proposal show sunflower --id PRP-0001
-& '[local path redacted]\agentmem.ps1' proposal approve sunflower --id PRP-0001 --expected-revision 1 --quote 'Yes, approve this exact rollout.' --source-type user_conversation --source-ref 'current Codex conversation' --recorded-by 'user-supplied wording' --idempotency-key rollout-approved-1
-& '[local path redacted]\agentmem.ps1' proposal status sunflower --id PRP-0001
-& '[local path redacted]\agentmem.ps1' proposal approval-history sunflower --id PRP-0001
-& '[local path redacted]\agentmem.ps1' knowledge init sunflower
-& '[local path redacted]\agentmem.ps1' knowledge list sunflower
-& '[local path redacted]\agentmem.ps1' knowledge read sunflower --id architecture
-& '[local path redacted]\agentmem.ps1' knowledge history sunflower --id architecture
+& '<path-to-agentmem-checkout>\agentmem.ps1' project list
+& '<path-to-agentmem-checkout>\agentmem.ps1' project resolve --cwd '<path-to-sunflower-checkout>'
+& '<path-to-agentmem-checkout>\agentmem.ps1' index sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' check sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' search sunflower 'controller API constraints'
+& '<path-to-agentmem-checkout>\agentmem.ps1' task list sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' export sunflower > sunflower-agentmem-export.json
+& '<path-to-agentmem-checkout>\agentmem.ps1' requirement create sunflower --title 'Keep API stable' --statement 'Do not remove public methods without approval.' --quote 'Keep the public API compatible.' --scope-json '{"project_wide":true}' --source-type user_conversation --source-ref 'current Codex conversation' --idempotency-key capture-api-01
+& '<path-to-agentmem-checkout>\agentmem.ps1' requirement list sunflower --lifecycle current
+& '<path-to-agentmem-checkout>\agentmem.ps1' requirement history sunflower --id REQ-0001
+& '<path-to-agentmem-checkout>\agentmem.ps1' task-context sunflower --id '<TASK_ID>'
+& '<path-to-agentmem-checkout>\agentmem.ps1' decision list sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' decision history sunflower --id DEC-0001
+& '<path-to-agentmem-checkout>\agentmem.ps1' proposal create sunflower --title 'Controller rollout' --content 'Preserve the public API while replacing internals.' --targets-json '[{"kind":"requirement","id":"REQ-0001","revision":2}]' --approval-required --created-by codex-main --idempotency-key rollout-draft-1
+& '<path-to-agentmem-checkout>\agentmem.ps1' proposal show sunflower --id PRP-0001
+& '<path-to-agentmem-checkout>\agentmem.ps1' proposal approve sunflower --id PRP-0001 --expected-revision 1 --quote 'Yes, approve this exact rollout.' --source-type user_conversation --source-ref 'current Codex conversation' --recorded-by 'user-supplied wording' --idempotency-key rollout-approved-1
+& '<path-to-agentmem-checkout>\agentmem.ps1' proposal status sunflower --id PRP-0001
+& '<path-to-agentmem-checkout>\agentmem.ps1' proposal approval-history sunflower --id PRP-0001
+& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge init sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge list sunflower
+& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge read sunflower --id architecture
+& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge history sunflower --id architecture
 ```
 
 To add a page, supply a lowercase slug, title, and body text: `knowledge create sunflower --id deployment --title 'Deployment' --content 'Document the verified deployment path.'`. To revise one, read it first and pass its current hash: `knowledge update sunflower --id deployment --expected-sha256 '<SHA256_FROM_READ>' --content "# Deployment`n`nUpdated verified deployment notes."`. A revision conflict means reread the page and reconcile the change before trying again. Use a normal single-line slug; file paths are not accepted by the page API.
@@ -163,7 +163,7 @@ To add a page, supply a lowercase slug, title, and body text: `knowledge create 
 ## Development checks
 
 ```powershell
-cd [local path redacted]
+Set-Location <path-to-agentmem-checkout>
 & '.\.venv\Scripts\python.exe' -m pytest -q
 ```
 

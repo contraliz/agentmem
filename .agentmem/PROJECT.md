@@ -6,7 +6,7 @@ A reusable project-scoped context and work-tracking module for Codex, intended t
 ## Verified implementation
 - Python domain/storage layer shared by the MCP server and CLI.
 - SQLite stores project task state, dependencies, claims/checkpoints, receipts, lessons, and a rebuildable FTS5 source index. Curated project context is Markdown in this folder.
-- Codex MCP entry `agentmem` is configured as a stdio server; data lives at `[local path redacted]\.agentmem-data\agentmem.sqlite3`.
+- Codex MCP entry `agentmem` is configured as a stdio server; its local registry and data remain outside version control.
 - `attach_project(project_id, query=...)` combines orientation and up to three focused, cited excerpts in one tool call. `include_sources=true` opts into the full path/hash manifest; the default packet includes source count/revision and citations retain hashes. Deeper searches remain available through `retrieve_evidence`.
 - `*.egg-info` build metadata is excluded from indexing and change scans.
 - Task claims use ownership leases; task context includes checkpoints, matching evidence, and accepted lessons. Receipts require evidence for every acceptance criterion before completion.
