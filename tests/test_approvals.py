@@ -153,7 +153,7 @@ def test_task_context_projection_search_conflict_and_export(store):
     found=store.search("p","Controller rollout plan")
     assert found["results"] and found["results"][0]["citation"].startswith("@memory/approvals.md#L")
     exported=store.export_project("p")
-    assert exported["schema_version"]==4 and len(exported["proposals"])==1 and len(exported["approval_events"])==1
+    assert exported["schema_version"]==6 and len(exported["proposals"])==1 and len(exported["approval_events"])==1
     document.write_text(document.read_text(encoding="utf-8")+"manual edit\n",encoding="utf-8")
     with pytest.raises(ValueError,match="Manual edits detected"):
         store.sync_records_projection("p","approvals")
@@ -188,10 +188,10 @@ def test_v5_database_upgrades_without_losing_task_or_requirement(tmp_path):
     assert store.get_task("p",task["id"])["title"]=="Existing task"
     assert store.get_requirement("p",req["id"])["statement"]==req["statement"]
     with store.connect("p") as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0]==7
+        assert db.execute("PRAGMA user_version").fetchone()[0]==10
         assert db.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
         assert {r[1] for r in db.execute("PRAGMA table_info(tasks)")}.__contains__("approval_proposal_id")
-    backups=list((tmp_path/"state"/"migration-backups").glob("project-schema-v5-to-v7-*.sqlite3"))
+    backups=list((tmp_path/"state"/"migration-backups").glob("project-schema-v5-to-v10-*.sqlite3"))
     assert backups
     with sqlite3.connect(backups[0]) as backup:
         assert backup.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
@@ -210,9 +210,9 @@ def test_v6_upgrade_recovers_event_snapshot_from_exact_proposal_history(tmp_path
     current=store.get_proposal("p",proposal["id"])
     assert current["approval"]["status"]=="approved"
     with store.connect("p") as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0]==7
+        assert db.execute("PRAGMA user_version").fetchone()[0]==10
         migrated=db.execute("SELECT proposal_snapshot FROM approval_events WHERE event_id=?",(recorded["event_id"],)).fetchone()[0]
         assert json.loads(migrated)["content"]==proposal["content"]
         assert db.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
-    backups=list((tmp_path/"state"/"migration-backups").glob("project-schema-v6-to-v7-*.sqlite3"))
+    backups=list((tmp_path/"state"/"migration-backups").glob("project-schema-v6-to-v10-*.sqlite3"))
     assert backups

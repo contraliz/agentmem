@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import fnmatch
+import collections
 import json
 import os
 import re
@@ -17,6 +18,7 @@ DEFAULT_DATA = Path(os.environ.get("AGENTMEM_DATA_DIR", Path.home() / ".agentmem
 DEFAULT_MEMORY_ROOT = Path(os.environ.get("AGENTMEM_MEMORY_ROOT", "D:/projects" if os.name == "nt" else Path.home() / "projects"))
 EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "target", "__pycache__", ".agentmem-data", ".agentmem", ".history", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
 SECRET_NAME = re.compile(r"(^|[._-])(\.env(?:\..*)?|secrets?|credentials?)([._-]|$)", re.I)
+SECRET_ASSIGNMENT = re.compile(r"(?i)(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|private[_-]?key)\s*[:=]\s*['\"]?([A-Za-z0-9_+/=-]{16,})")
 SECRET_SUFFIXES = {".pem", ".key", ".token", ".secret", ".p12", ".pfx", ".cer", ".crt", ".sqlite", ".db"}
 SENSITIVE_BASENAMES = {".npmrc", ".pypirc", ".netrc", "id_rsa", "id_ed25519", "id_ecdsa"}
 TEXT_SUFFIXES = {".md", ".txt", ".rst", ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".css", ".scss", ".sql", ".sh", ".ps1", ".bat", ".java", ".kt", ".go", ".rs", ".c", ".h", ".cpp", ".cs", ".swift", ".rb", ".php", ".vue", ".svelte", ".graphql", ".proto", ".ini", ".cfg", ".csv", ".log"}
@@ -27,6 +29,7 @@ KNOWLEDGE_PAGE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 RESERVED_KNOWLEDGE_PAGE_IDS = {"requirements", "decisions", "index", "project"}
 MAX_PROPOSAL_BYTES = 64_000
 MAX_PROPOSAL_TARGETS = 50
+MAX_EVIDENCE_EXCERPT_CHARS = 2400
 KNOWLEDGE_PAGE_TEMPLATES = {
     "purpose": ("Purpose and scope", "Document verified project goals, users, boundaries, and non-goals.\n\nNot documented yet."),
     "architecture": ("Architecture", "Document the major components, interfaces, data flows, and rationale. Link source files rather than copying large code excerpts.\n\nNot documented yet."),
@@ -38,6 +41,23 @@ KNOWLEDGE_PAGE_TEMPLATES = {
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _request_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+class AgentMemError(ValueError):
+    """Expected domain rejection with a stable, caller-actionable recovery hint."""
+
+    def __init__(self, code: str, reason: str, recovery: str):
+        super().__init__(reason)
+        self.code = code
+        self.reason = reason
+        self.recovery = recovery
+
+    def as_dict(self) -> dict[str, str]:
+        return {"code": self.code, "reason": self.reason, "recovery": self.recovery}
 
 
 class MemoryStore:
@@ -112,7 +132,7 @@ class MemoryStore:
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA journal_mode=WAL")
         current_schema = db.execute("PRAGMA user_version").fetchone()[0]
-        if current_schema > 7:
+        if current_schema > 10:
             db.close()
             raise RuntimeError(f"Database schema {current_schema} is newer than this Agent Memory version")
         db.executescript("""
@@ -135,7 +155,14 @@ class MemoryStore:
               checkpoint TEXT NOT NULL DEFAULT '{}', owner TEXT NOT NULL DEFAULT '',
               lease_token TEXT NOT NULL DEFAULT '', lease_until REAL NOT NULL DEFAULT 0,
               source_revision TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
-              components TEXT NOT NULL DEFAULT '[]', approval_proposal_id TEXT NOT NULL DEFAULT '');
+              components TEXT NOT NULL DEFAULT '[]', approval_proposal_id TEXT NOT NULL DEFAULT '', acceptance_revision INTEGER NOT NULL DEFAULT 1);
+            CREATE TABLE IF NOT EXISTS task_acceptance_history(
+              task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+              project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              revision INTEGER NOT NULL, criteria TEXT NOT NULL, change_note TEXT NOT NULL DEFAULT '',
+              source_type TEXT NOT NULL DEFAULT '', source_ref TEXT NOT NULL DEFAULT '', source_date TEXT NOT NULL DEFAULT '',
+              idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL, recorded_at REAL NOT NULL,
+              PRIMARY KEY(task_id,revision), UNIQUE(project_id,idempotency_key));
             CREATE TABLE IF NOT EXISTS dependencies(
               task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
               depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -144,7 +171,7 @@ class MemoryStore:
               id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
               project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
               owner TEXT NOT NULL, body TEXT NOT NULL, created_at REAL NOT NULL, idempotency_key TEXT NOT NULL,
-              UNIQUE(task_id,idempotency_key));
+              request_hash TEXT NOT NULL DEFAULT '', UNIQUE(task_id,idempotency_key));
             CREATE TABLE IF NOT EXISTS lessons(
               id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
               title TEXT NOT NULL, trigger_text TEXT NOT NULL, procedure TEXT NOT NULL,
@@ -248,8 +275,30 @@ class MemoryStore:
             task_columns={r[1] for r in db.execute("PRAGMA table_info(tasks)")}
             if "components" not in task_columns: db.execute("ALTER TABLE tasks ADD COLUMN components TEXT NOT NULL DEFAULT '[]'")
             if "approval_proposal_id" not in task_columns: db.execute("ALTER TABLE tasks ADD COLUMN approval_proposal_id TEXT NOT NULL DEFAULT ''")
+            if "acceptance_revision" not in task_columns: db.execute("ALTER TABLE tasks ADD COLUMN acceptance_revision INTEGER NOT NULL DEFAULT 1")
+            for task in db.execute("SELECT id,project_id,acceptance,acceptance_revision FROM tasks").fetchall():
+                if not db.execute("SELECT 1 FROM task_acceptance_history WHERE task_id=?",(task["id"],)).fetchone():
+                    criteria=task["acceptance"] if isinstance(task["acceptance"],str) else "[]"
+                    digest=hashlib.sha256(_json({"task_id":task["id"],"revision":task["acceptance_revision"],"criteria":json.loads(criteria)}).encode("utf-8")).hexdigest()
+                    db.execute("INSERT INTO task_acceptance_history(task_id,project_id,revision,criteria,change_note,source_type,source_ref,source_date,idempotency_key,request_hash,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (task["id"],task["project_id"],task["acceptance_revision"],criteria,"Migrated saved acceptance criteria", "schema_migration", "", "", f"migration:{task['id']}:{task['acceptance_revision']}", digest, time.time()))
             revision_columns={r[1] for r in db.execute("PRAGMA table_info(project_record_revisions)")}
             if "approvals_revision" not in revision_columns: db.execute("ALTER TABLE project_record_revisions ADD COLUMN approvals_revision INTEGER NOT NULL DEFAULT 0")
+            lesson_columns={r[1] for r in db.execute("PRAGMA table_info(lessons)")}
+            for name, definition in {
+                "environment":"TEXT NOT NULL DEFAULT '{}'",
+                "confirmed_cause":"TEXT NOT NULL DEFAULT ''",
+                "preconditions":"TEXT NOT NULL DEFAULT '[]'",
+                "exclusions":"TEXT NOT NULL DEFAULT '[]'",
+                "source_task_id":"TEXT NOT NULL DEFAULT ''",
+                "review_note":"TEXT NOT NULL DEFAULT ''",
+                "hypotheses":"TEXT NOT NULL DEFAULT '[]'",
+            }.items():
+                if name not in lesson_columns:
+                    db.execute(f"ALTER TABLE lessons ADD COLUMN {name} {definition}")
+            receipt_columns={r[1] for r in db.execute("PRAGMA table_info(receipts)")}
+            if "request_hash" not in receipt_columns:
+                db.execute("ALTER TABLE receipts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
             event_columns={r[1] for r in db.execute("PRAGMA table_info(approval_events)")}
             if "proposal_snapshot" not in event_columns:
                 db.execute("ALTER TABLE approval_events ADD COLUMN proposal_snapshot TEXT NOT NULL DEFAULT '{}'")
@@ -267,7 +316,7 @@ class MemoryStore:
                         db.execute("UPDATE approval_events SET proposal_snapshot=? WHERE event_id=?",(_json(snapshot),event["event_id"]))
             db.execute("CREATE INDEX IF NOT EXISTS idx_proposals_project_updated ON proposals(project_id,updated_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_approval_events_proposal ON approval_events(project_id,proposal_id,id DESC)")
-            db.execute("PRAGMA user_version=7")
+            db.execute("PRAGMA user_version=10")
             db.commit()
         except Exception:
             db.rollback()
@@ -275,32 +324,41 @@ class MemoryStore:
         db.close()
 
     def _ensure_project_schema(self, db_path: Path) -> None:
-        db=sqlite3.connect(db_path,timeout=15,isolation_level=None)
+        # Serialize upgrades across separate AgentMem processes with the shared
+        # locator DB; a per-project migration lock table could itself be absent
+        # in the schema being upgraded.
+        lock=sqlite3.connect(self.db_path,timeout=30,isolation_level=None)
         try:
-            version=db.execute("PRAGMA user_version").fetchone()[0]
+            lock.execute("BEGIN IMMEDIATE")
+            probe=sqlite3.connect(db_path,timeout=30,isolation_level=None)
+            try: version=probe.execute("PRAGMA user_version").fetchone()[0]
+            finally: probe.close()
+            if version < 10:
+                if version>0 and db_path.is_file():
+                    # Use SQLite's online backup API so committed WAL content is
+                    # included before an additive schema migration.
+                    backups=self.data_dir/"migration-backups"; backups.mkdir(parents=True,exist_ok=True)
+                    backup_path=backups/f"project-schema-v{version}-to-v10-{int(time.time())}-{uuid.uuid4().hex[:8]}.sqlite3"
+                    source=sqlite3.connect(db_path,timeout=30)
+                    backup=sqlite3.connect(backup_path)
+                    try:
+                        source.backup(backup)
+                        result=backup.execute("PRAGMA integrity_check").fetchone()[0]
+                        if result!="ok": raise RuntimeError(f"Project schema backup failed integrity check: {result}")
+                        backup.commit()
+                    except Exception:
+                        backup.close(); source.close()
+                        backup_path.unlink(missing_ok=True)
+                        raise
+                    finally:
+                        backup.close(); source.close()
+                self._create_project_database(db_path)
+            lock.commit()
+        except Exception:
+            lock.rollback()
+            raise
         finally:
-            db.close()
-        if version < 7:
-            if version>0 and db_path.is_file():
-                # Use SQLite's online backup API so committed WAL content is
-                # included before an additive schema migration.
-                backups=self.data_dir/"migration-backups"; backups.mkdir(parents=True,exist_ok=True)
-                backup_path=backups/f"project-schema-v{version}-to-v7-{int(time.time())}-{uuid.uuid4().hex[:8]}.sqlite3"
-                source=sqlite3.connect(db_path,timeout=30)
-                backup=sqlite3.connect(backup_path)
-                try:
-                    source.backup(backup)
-                    result=backup.execute("PRAGMA integrity_check").fetchone()[0]
-                    if result!="ok": raise RuntimeError(f"Project schema backup failed integrity check: {result}")
-                    backup.commit()
-                except Exception:
-                    backup.close(); source.close()
-                    backup_path.unlink(missing_ok=True)
-                    raise
-                finally:
-                    if backup: backup.close()
-                    if source: source.close()
-            self._create_project_database(db_path)
+            lock.close()
 
     def _migrate_registry_if_legacy_rows(self) -> None:
         with self.connect() as db:
@@ -474,6 +532,10 @@ class MemoryStore:
                 target_cols = cols.split(",")
                 placeholders = ",".join("?" for _ in target_cols)
                 target.executemany(f"INSERT INTO {table}({cols}) VALUES({placeholders})", [tuple(r) for r in rows])
+            for task in target.execute("SELECT id,project_id,acceptance,acceptance_revision FROM tasks WHERE project_id=?",(project_id,)).fetchall():
+                digest=hashlib.sha256(_json({"task_id":task["id"],"revision":task["acceptance_revision"],"criteria":json.loads(task["acceptance"])}).encode("utf-8")).hexdigest()
+                target.execute("INSERT INTO task_acceptance_history(task_id,project_id,revision,criteria,change_note,source_type,idempotency_key,request_hash,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (task["id"],project_id,task["acceptance_revision"],task["acceptance"],"Migrated saved acceptance criteria","legacy_migration",f"migration:{task['id']}:{task['acceptance_revision']}",digest,time.time()))
             old_rows = snapshot.execute("SELECT relpath,sha256 FROM sources WHERE project_id=? ORDER BY relpath", (project_id,)).fetchall()
             old_revision = hashlib.sha256("\n".join(f"{r[0]}:{r[1]}" for r in old_rows).encode()).hexdigest()[:16]
             new_rows = target.execute("SELECT relpath,sha256 FROM sources WHERE project_id=? ORDER BY relpath", (project_id,)).fetchall()
@@ -767,6 +829,14 @@ class MemoryStore:
                            (project_id,relpath,digest,start+1,min(start+35,len(lines)),body))
         return True
 
+    def _contains_secret_material(self, path: Path) -> bool:
+        """Conservatively skip files containing credential-shaped assignments."""
+        try:
+            with path.open("r",encoding="utf-8") as stream:
+                return any(SECRET_ASSIGNMENT.search(line) for line in stream)
+        except (OSError,UnicodeError):
+            return True
+
     def index_project(self, project_id: str, max_files: int = 5000) -> dict[str, Any]:
         project = self.get_project(project_id)
         if not 1 <= max_files <= 20000:
@@ -780,6 +850,9 @@ class MemoryStore:
                 if scanned > max_files:
                     break
                 if not self._safe_file(Path(project["memory_root"]) if rel.startswith("@memory/") else Path(project["root"]),path):
+                    skipped += 1
+                    continue
+                if self._contains_secret_material(path):
                     skipped += 1
                     continue
                 indexed_change=self._index_file(db,project_id,rel,path,now)
@@ -816,6 +889,7 @@ class MemoryStore:
                 "deleted_paths":removed[:30],"changed_count":len(changed),"new_count":len(added),
                 "deleted_count":len(removed),"paths_truncated":len(changed)+len(added)+len(removed)>30,
                 "scan_truncated":truncated,"method":"path/mtime/size only; file contents were not read",
+                "freshness_level":"metadata_scan_only",
                 "source_revision":self.source_revision(project_id)}
 
     def source_revision(self, project_id: str) -> str:
@@ -838,7 +912,7 @@ class MemoryStore:
         return list(dict.fromkeys(result))
 
     def search(self, project_id: str, query: str, limit: int = 5) -> dict[str, Any]:
-        self.get_project(project_id)
+        project=self.get_project(project_id)
         limit = min(max(int(limit), 1), 12)
         query = query.strip()
         if not query:
@@ -849,7 +923,7 @@ class MemoryStore:
         # Quote each token so punctuation and FTS operators from the user's query cannot alter syntax.
         fts_query = " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens[:20])
         with self.connect(project_id) as db:
-            rows = db.execute("""SELECT relpath,sha256,line_start,line_end,substr(body,1,2400) AS excerpt,bm25(chunks) AS score
+            rows = db.execute("""SELECT relpath,sha256,line_start,line_end,body,bm25(chunks) AS score
               FROM chunks WHERE project_id=? AND chunks MATCH ? ORDER BY score LIMIT ?""", (project_id, fts_query, limit)).fetchall()
             # FTS5's unicode tokenizer treats a contiguous CJK run as one token. Fall back
             # to bounded substring matching on overlapping bigrams for ordinary Chinese queries.
@@ -864,19 +938,53 @@ class MemoryStore:
                     clauses=" OR ".join("instr(body,?)>0" for _ in grams)
                     score_expr=" + ".join("CASE WHEN instr(body,?)>0 THEN 1 ELSE 0 END" for _ in grams)
                     params=[*grams,project_id,*grams,limit]
-                    rows=db.execute(f"""SELECT relpath,sha256,line_start,line_end,substr(body,1,2400) AS excerpt,
+                    rows=db.execute(f"""SELECT relpath,sha256,line_start,line_end,body,
                       ({score_expr}) AS score FROM chunks WHERE project_id=? AND ({clauses})
                       ORDER BY score DESC LIMIT ?""",params).fetchall()
             results = []
             for r in rows:
                 indexed = db.execute("SELECT sha256,indexed_at FROM sources WHERE project_id=? AND relpath=?", (project_id,r["relpath"])).fetchone()
+                body=r["body"]
+                folded=body.casefold()
+                hit_terms=[token for token in tokens if token]
+                for run in re.findall(r"[\u3400-\u9fff\uf900-\ufaff]+",query):
+                    hit_terms.extend([run[i:i+2] for i in range(len(run)-1)] or [run])
+                positions=[folded.find(token.casefold()) for token in hit_terms if token and folded.find(token.casefold())>=0]
+                hit=min(positions) if positions else 0
+                width=MAX_EVIDENCE_EXCERPT_CHARS
+                excerpt_start=max(0,min(hit-width//2,max(0,len(body)-width)))
+                excerpt=body[excerpt_start:excerpt_start+width]
+                current_path=self._source_path(project,r["relpath"])
+                try:
+                    source_root=Path(project["memory_root"] if r["relpath"].startswith("@memory/") else project["root"]).resolve(strict=True)
+                    if not self._safe_file(source_root,current_path):
+                        raise OSError("indexed source is no longer safe")
+                    current_text=current_path.read_text(encoding="utf-8")
+                    current_hash=hashlib.sha256(current_text.encode("utf-8")).hexdigest()
+                    freshness="content_checked" if current_hash==r["sha256"] else "content_changed"
+                except (OSError,UnicodeError):
+                    freshness="source_unavailable"
                 results.append({"citation": f"{r['relpath']}#L{r['line_start']}-L{r['line_end']}", "path": r["relpath"],
                                 "line_start": int(r["line_start"]), "line_end": int(r["line_end"]), "sha256": r["sha256"],
-                                "fresh": bool(indexed and indexed["sha256"] == r["sha256"]), "indexed_at": indexed["indexed_at"] if indexed else None,
-                                "excerpt": r["excerpt"]})
+                                "fresh": freshness=="content_checked", "index_consistent": bool(indexed and indexed["sha256"] == r["sha256"]),
+                                "freshness_level": freshness, "indexed_at": indexed["indexed_at"] if indexed else None,
+                                "excerpt": excerpt, "excerpt_char_start": excerpt_start,
+                                "excerpt_truncated": excerpt_start>0 or excerpt_start+len(excerpt)<len(body)})
         return {"project_id": project_id, "query": query, "results": results,
                 "gap": "No indexed evidence matched. Index the project or ask a narrower question." if not results else "",
                 "source_revision": self.source_revision(project_id)}
+
+    @staticmethod
+    def _excerpt_around_query(excerpt: str, query: str, width: int) -> tuple[str,int]:
+        if len(excerpt)<=width: return excerpt,0
+        terms=re.findall(r"[\w\u0080-\uffff]+",query,flags=re.UNICODE)
+        for run in re.findall(r"[\u3400-\u9fff\uf900-\ufaff]+",query):
+            terms.extend([run[i:i+2] for i in range(len(run)-1)] or [run])
+        folded=excerpt.casefold()
+        positions=[folded.find(term.casefold()) for term in terms if term and folded.find(term.casefold())>=0]
+        hit=min(positions) if positions else 0
+        start=max(0,min(hit-width//2,len(excerpt)-width))
+        return excerpt[start:start+width],start
 
     def attach(self, project_id: str, max_chars: int = 6500, query: str = "", include_sources: bool = False) -> dict[str, Any]:
         project = self.get_project(project_id)
@@ -886,7 +994,7 @@ class MemoryStore:
             listed_knowledge=self.list_knowledge_pages(project_id,limit=12)
             knowledge_pages={"initialized":True,"directory":listed_knowledge["directory"],"count":listed_knowledge["count"],
                              "unindexed_count":listed_knowledge["unindexed_count"],
-                             "pages":[{"page_id":x["page_id"],"title":x["title"],"path":x["path"],"fresh":x["fresh"]} for x in listed_knowledge["pages"]],
+                             "pages":[{"page_id":x["page_id"],"title":x["title"],"description":x["description"],"path":x["path"],"fresh":x["fresh"]} for x in listed_knowledge["pages"]],
                              "pages_truncated":listed_knowledge["next_offset"] is not None}
         except ValueError as exc:
             if not str(exc).startswith("Knowledge pages are not initialized"):
@@ -985,7 +1093,8 @@ class MemoryStore:
             evidence = self.search(project_id, query, limit=3)
             for result in evidence["results"]:
                 original = result["excerpt"]
-                result["excerpt"] = original[:1200]
+                result["excerpt"],cut=self._excerpt_around_query(original,query,1200)
+                result["excerpt_char_start"]+=cut
                 result["excerpt_truncated"] = len(original) > 1200
             card["question_context"] = evidence
             card["question_context_note"] = "Focused cited evidence for this question. Ask retrieve_evidence for more or narrower evidence; the service does not generate an answer."
@@ -993,7 +1102,8 @@ class MemoryStore:
             while len(_json(card))>max_chars and card["question_context"]["results"]:
                 result=card["question_context"]["results"][0]
                 if len(result["excerpt"])>120:
-                    result["excerpt"]=result["excerpt"][:max(120,len(result["excerpt"])//2)]
+                    result["excerpt"],cut=self._excerpt_around_query(result["excerpt"],query,max(120,len(result["excerpt"])//2))
+                    result["excerpt_char_start"]+=cut
                     result["excerpt_truncated"]=True
                 elif len(card["question_context"]["results"])>1:
                     card["question_context"]["results"].pop(); omitted+=1
@@ -1005,6 +1115,31 @@ class MemoryStore:
                 card={"project":{"id":project_id,"name":project["name"]},"source_revision":self.source_revision(project_id),
                       "requirements":{"revision":int(rv["requirements_revision"]) if rv else 0,"current_count":len(current_reqs),"decisions_revision":int(rv["decisions_revision"]) if rv else 0,"truncated":True,"retrieve_action":"Call requirements or decisions for full records."},
                       "question_context":{"query":query,"results":first,"gap":evidence["gap"],"truncated":True,"results_omitted_for_budget":max(0,len(evidence["results"])-len(first))},"truncated":True}
+        if len(_json(card))>max_chars:
+            context=card.get("question_context",{})
+            final={"project":{"id":project_id},"source_revision":card.get("source_revision",self.source_revision(project_id)),
+                "requirements":{"revision":int(rv["requirements_revision"]) if rv else 0,"current_count":len(current_reqs),
+                    "truncated":True,"retrieve_action":"Call task_context or requirements for mandatory full records."},
+                "truncated":True,"omissions":["brief","page inventory","task list","full requirement text"]}
+            if query.strip():
+                results=context.get("results",[])
+                final["question_context"]={"query":query[:120],"results":[],"gap":context.get("gap",evidence["gap"]),
+                    "truncated":True,"results_omitted_for_budget":len(evidence["results"]),
+                    "retrieve_action":"Call retrieve_evidence with a focused query to continue."}
+                if results:
+                    first_result=results[0]
+                    compact={key:first_result[key] for key in ("citation","line_start","line_end","sha256","fresh","freshness_level","excerpt","excerpt_char_start") if key in first_result}
+                    final["question_context"]["results"]=[compact]
+                    final["question_context"]["results_omitted_for_budget"]=max(0,len(evidence["results"])-1)
+                    while len(_json(final))>max_chars and compact.get("excerpt"):
+                        width=max(0,len(compact["excerpt"])//2)
+                        compact["excerpt"],cut=self._excerpt_around_query(compact["excerpt"],query,width) if width>=1 else ("",0)
+                        compact["excerpt_char_start"]=compact.get("excerpt_char_start",0)+cut
+                    if len(_json(final))>max_chars:
+                        final["question_context"]["results"]=[]
+                        final["question_context"]["results_omitted_for_budget"]=len(evidence["results"])
+                        final["question_context"]["continuation"]="retrieve_evidence"
+            card=final
         return card
 
     def create_task(self, project_id: str, title: str, goal: str, acceptance: list[str] | None = None,
@@ -1030,6 +1165,7 @@ class MemoryStore:
                 raise ValueError("approval_proposal_id must name a proposal in this project")
             db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,acceptance,authorized_paths,blocked_reason,created_at,updated_at,source_revision,components,approval_proposal_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (task_id,project_id,title.strip(),goal.strip(),int(priority),_json(acceptance or []),_json(safe_paths),blocked_reason.strip(),now,now,self.source_revision(project_id),_json(components),approval_proposal_id))
+            self._record_task_acceptance(db,task_id,project_id,1,acceptance or [],"Task created","task_creation","", "", f"create:{task_id}")
             for rid in requirement_ids:
                 req=db.execute("SELECT revision,lifecycle,criteria FROM requirements WHERE id=? AND project_id=?",(rid,project_id)).fetchone()
                 if not req or req["lifecycle"]!="current": raise ValueError(f"Requirement {rid!r} is missing, non-current, or belongs to another project")
@@ -1038,6 +1174,47 @@ class MemoryStore:
             if self._has_cycle(db, task_id): raise ValueError("Task dependencies must be acyclic")
             db.commit()
         return self.get_task(project_id, task_id)
+
+    def _record_task_acceptance(self, db: sqlite3.Connection, task_id: str, project_id: str, revision: int,
+                                criteria: list[str], change_note: str, source_type: str, source_ref: str,
+                                source_date: str, idempotency_key: str) -> None:
+        normalized=list(criteria)
+        digest=_request_hash({"task_id":task_id,"criteria":normalized,"change_note":change_note,
+            "source_type":source_type,"source_ref":source_ref,"source_date":source_date})
+        db.execute("INSERT INTO task_acceptance_history(task_id,project_id,revision,criteria,change_note,source_type,source_ref,source_date,idempotency_key,request_hash,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id,project_id,revision,_json(normalized),change_note,source_type,source_ref,source_date,idempotency_key,digest,time.time()))
+
+    def revise_task_acceptance(self, project_id: str, task_id: str, owner: str, lease_token: str,
+                               acceptance: list[str], idempotency_key: str, change_note: str,
+                               source_type: str, source_ref: str, source_date: str = "") -> dict[str, Any]:
+        self._require_idempotency_key(idempotency_key)
+        if not isinstance(acceptance,list) or not all(isinstance(x,str) and x.strip() for x in acceptance):
+            raise ValueError("acceptance must be a list of non-empty criteria strings")
+        if not all(isinstance(x,str) and x.strip() for x in (owner,lease_token,change_note,source_type,source_ref)):
+            raise ValueError("owner, lease token, change note, source type, and source reference are required")
+        criteria=[x.strip() for x in acceptance]
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row=db.execute("SELECT * FROM tasks WHERE project_id=? AND id=?",(project_id,task_id)).fetchone()
+            if not row: raise ValueError("Task not found in this project")
+            request_hash=_request_hash({"task_id":task_id,"criteria":criteria,"change_note":change_note,"source_type":source_type,"source_ref":source_ref,"source_date":source_date})
+            prior=db.execute("SELECT revision,request_hash FROM task_acceptance_history WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
+            if prior:
+                if prior["request_hash"]!=request_hash: raise ValueError("idempotency_key was already used with different acceptance content")
+                db.commit(); return self.get_task(project_id,task_id)|{"acceptance_change_duplicate":True,"acceptance_change_revision":prior["revision"]}
+            if row["owner"]!=owner or row["lease_token"]!=lease_token or row["lease_until"]<time.time():
+                raise ValueError("Ownership lease is missing, expired, or does not match")
+            next_revision=int(row["acceptance_revision"])+1
+            self._record_task_acceptance(db,task_id,project_id,next_revision,criteria,change_note,source_type,source_ref,source_date,idempotency_key)
+            db.execute("UPDATE tasks SET acceptance=?,acceptance_revision=?,updated_at=? WHERE id=?",(_json(criteria),next_revision,time.time(),task_id))
+            db.commit()
+        return self.get_task(project_id,task_id)|{"acceptance_change_duplicate":False,"acceptance_change_revision":next_revision}
+
+    def task_acceptance_history(self, project_id: str, task_id: str) -> dict[str, Any]:
+        with self.connect(project_id) as db:
+            if not db.execute("SELECT 1 FROM tasks WHERE project_id=? AND id=?",(project_id,task_id)).fetchone(): raise ValueError("Task not found in this project")
+            rows=db.execute("SELECT revision,criteria,change_note,source_type,source_ref,source_date,idempotency_key,request_hash,recorded_at FROM task_acceptance_history WHERE project_id=? AND task_id=? ORDER BY revision",(project_id,task_id)).fetchall()
+        return {"project_id":project_id,"task_id":task_id,"history":[dict(row)|{"criteria":json.loads(row["criteria"])} for row in rows]}
 
     def update_task(self, project_id: str, task_id: str, title: str | None = None, goal: str | None = None,
                     acceptance: list[str] | None = None, priority: int | None = None,
@@ -1080,6 +1257,10 @@ class MemoryStore:
                 raise ValueError("approval_proposal_id must name a proposal in this project")
             db.execute("UPDATE tasks SET title=?,goal=?,acceptance=?,priority=?,authorized_paths=?,components=?,blocked_reason=?,approval_proposal_id=?,updated_at=? WHERE id=?",
                        (changes["title"],changes["goal"],changes["acceptance"],changes["priority"],changes["authorized_paths"],changes["components"],changes["blocked_reason"],proposal_id,now,task_id))
+            if acceptance is not None and _json(acceptance)!=row["acceptance"]:
+                next_revision=int(row["acceptance_revision"])+1
+                self._record_task_acceptance(db,task_id,project_id,next_revision,acceptance,"Updated while task was open","task_update","", "",f"task-update:{task_id}:{next_revision}")
+                db.execute("UPDATE tasks SET acceptance_revision=? WHERE id=?",(next_revision,task_id))
             db.commit()
         return self.get_task(project_id,task_id)
 
@@ -1110,10 +1291,18 @@ class MemoryStore:
         raise ValueError(f"Unknown task {task_id!r} in project {project_id!r}")
 
     def task_context(self, project_id: str, task_id: str, max_chars: int = 6000,
-                     requirement_offset: int = 0, requirements_limit: int = 8) -> dict[str, Any]:
+                     requirement_offset: int = 0, requirements_limit: int = 8,
+                     acceptance_offset: int = 0, acceptance_limit: int = 20) -> dict[str, Any]:
         raw_task=self.get_task(project_id,task_id)
-        task={k:raw_task[k] for k in ("id","title","goal","priority","status","acceptance","authorized_paths","blocked_reason","checkpoint","dependencies","blocked_by","ready","blocked","source_revision","approval_proposal_id")}
-        max_chars=min(max(1000,int(max_chars)),12000)
+        task={k:raw_task[k] for k in ("id","title","goal","priority","status","acceptance","acceptance_revision","authorized_paths","blocked_reason","checkpoint","dependencies","blocked_by","ready","blocked","source_revision","approval_proposal_id")}
+        max_chars=min(max(1000,int(max_chars)),100000)
+        if acceptance_offset<0 or not 1<=acceptance_limit<=1000: raise ValueError("acceptance_offset must be >=0 and acceptance_limit between 1 and 1000")
+        all_acceptance=task["acceptance"]
+        task["acceptance_total"]=len(all_acceptance)
+        task["acceptance_offset"]=acceptance_offset
+        task["acceptance"]=all_acceptance[acceptance_offset:acceptance_offset+acceptance_limit]
+        task["acceptance_complete"]=acceptance_offset+len(task["acceptance"])>=len(all_acceptance)
+        task["next_acceptance_offset"]=None if task["acceptance_complete"] else acceptance_offset+len(task["acceptance"])
         query=(task["title"]+" "+task["goal"]).strip()
         evidence=self.search(project_id,query,limit=5)
         lessons=self.search_lessons(project_id,query,limit=5)
@@ -1147,12 +1336,29 @@ class MemoryStore:
             packet["task"]["authorized_paths"]=packet["task"]["authorized_paths"][:3]
             packet["evidence_gap"]="Packet truncated; retrieve evidence separately."
         if len(_json(packet))>max_chars:
-            packet={"project_id":project_id,"task":{"id":task_id,"title":task["title"][:80],"status":task["status"],"ready":task["ready"]},
-                    "requirements":{"requirements_revision":req_context["requirements_revision"],"applicable_count":req_context["applicable_count"],"requirements_complete":False,"next_requirement_offset":requirement_offset,"required_action":"Call task_context with a larger max_chars or next requirement offset; governing requirements were omitted for output budget."},
+            packet={"project_id":project_id,"task":{"id":task_id,"title":task["title"][:80],"status":task["status"],"ready":task["ready"],
+                    "acceptance_revision":raw_task["acceptance_revision"],"acceptance_total":len(all_acceptance),"acceptance_complete":False,"next_acceptance_offset":acceptance_offset},
+                    "requirements":{"requirements_revision":req_context["requirements_revision"],"applicable_count":req_context["applicable_count"],"requirements_complete":False,"next_requirement_offset":requirement_offset,"required_action":"Continue task_context with the listed requirement and acceptance offsets; the packet omitted mandatory pages for output budget."},
                     "approval":approval_context,
                     "task_source_revision":task["source_revision"],"current_source_revision":current_revision,
                     "indexed_source_revision_changed_since_creation":task["source_revision"]!=current_revision,
                     "source_change_counts":{k:change_summary[k] for k in ("changed_count","new_count","deleted_count","scan_truncated")},"truncated":True}
+        if len(_json(packet))>max_chars:
+            # Keep status and stable continuation references when even compact
+            # approval metadata would exceed the requested serialized budget.
+            minimal_approval=None
+            if approval_context:
+                minimal_approval={k:approval_context.get(k) for k in ("proposal_id","status","approval_required","proposal_revision","approved_revision","target_status")}
+                latest=approval_context.get("latest_event") or {}
+                summary=latest.get("original_quote_summary") or {}
+                if summary:
+                    minimal_approval["quote_continuation"]={"event_id":summary.get("event_id"),"characters":summary.get("characters"),
+                        "sha256":summary.get("sha256"),"retrieve":"proposals(action='approval-history')"}
+            packet={"project_id":project_id,"task":{"id":task_id,"status":task["status"],"acceptance_revision":raw_task["acceptance_revision"],
+                    "acceptance_total":len(all_acceptance),"acceptance_complete":False,"next_acceptance_offset":acceptance_offset},
+                    "requirements":{"requirements_revision":req_context["requirements_revision"],"applicable_count":req_context["applicable_count"],
+                    "requirements_complete":False,"next_requirement_offset":requirement_offset,"required_action":"Continue task_context with these offsets."},
+                    "approval":minimal_approval,"truncated":True,"budget_chars":max_chars}
         return packet
 
     def claim_task(self, project_id: str, task_id: str, owner: str, lease_seconds: int = 1800) -> dict[str, Any]:
@@ -1204,20 +1410,40 @@ class MemoryStore:
         return self.get_task(project_id,task_id)
 
     def record_receipt(self, project_id: str, task_id: str, owner: str, lease_token: str, receipt: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
-        if not idempotency_key.strip(): raise ValueError("idempotency_key is required")
+        self._require_idempotency_key(idempotency_key)
+        request_hash=_request_hash(receipt)
         now=time.time(); receipt_id=uuid.uuid4().hex
         checks=receipt.get("acceptance_checks",[])
-        all_met=bool(checks) and all(bool(c.get("evidence")) and c.get("met") is True for c in checks)
+        if not isinstance(checks,list): checks=[]
+        all_met=all(isinstance(c,dict) and isinstance(c.get("evidence"),str) and bool(c["evidence"].strip()) and c.get("met") is True for c in checks)
         requested_done=receipt.get("status")=="done"
         with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM tasks WHERE id=? AND project_id=?",(task_id,project_id)).fetchone()
             if not row: raise ValueError("Task not found in this project")
+            saved_acceptance=json.loads(row["acceptance"])
+            current_acceptance_revision=int(row["acceptance_revision"] or 1)
+            submitted_acceptance_revision=receipt.get("acceptance_revision",1 if current_acceptance_revision==1 else None)
+            saved_counts=collections.Counter(saved_acceptance)
+            submitted=[]
+            for item in checks:
+                criterion=item.get("criterion") if isinstance(item,dict) else None
+                if isinstance(criterion,str): submitted.append(criterion)
+            submitted_counts=collections.Counter(submitted)
+            missing_criteria=list((saved_counts-submitted_counts).elements())
+            duplicate_criteria=[criterion for criterion,count in submitted_counts.items() if count>saved_counts.get(criterion,0)]
+            unknown_criteria=[criterion for criterion in submitted if criterion not in saved_counts]
+            acceptance_revision_matches=submitted_acceptance_revision==current_acceptance_revision
+            acceptance_covered=acceptance_revision_matches and not missing_criteria and not duplicate_criteria and not unknown_criteria and all_met
             old=db.execute("SELECT * FROM receipts WHERE task_id=? AND idempotency_key=?",(task_id,idempotency_key)).fetchone()
             if old:
                 if old["owner"] != owner:
                     raise ValueError("Idempotency key already belongs to a different owner")
-                db.commit(); return {"receipt_id":old["id"],"status":db.execute("SELECT status FROM tasks WHERE id=?",(task_id,)).fetchone()[0],"duplicate":True}
+                if not old["request_hash"]:
+                    raise ValueError("This legacy receipt has no request hash; inspect it with task show before creating a new receipt with a fresh idempotency key")
+                if old["request_hash"]!=request_hash:
+                    raise ValueError("idempotency_key was already used with different receipt content")
+                db.commit(); return {"receipt_id":old["id"],"status":db.execute("SELECT status FROM tasks WHERE id=?",(task_id,)).fetchone()[0],"duplicate":True,"completion_accepted":True}
             if row["owner"]!=owner or row["lease_token"]!=lease_token or row["lease_until"]<now: raise ValueError("Ownership lease is missing, expired, or does not match")
             raw_task=dict(row); raw_task["components"]=json.loads(raw_task.get("components","[]"))
             req_context=self._task_requirements(project_id,raw_task,0,1000,connection=db)
@@ -1235,9 +1461,9 @@ class MemoryStore:
                 if not gated_proposal: raise ValueError("Task approval proposal is missing from this project")
                 if gated_proposal["approval_required"]:
                     approval_met=self._proposal_status(db,row["approval_proposal_id"])["status"]=="approved"
-            final_status="done" if requested_done and all_met and requirements_met and approval_met else "in_progress"
+            final_status="done" if requested_done and acceptance_covered and requirements_met and approval_met else "in_progress"
             body=_json(receipt)
-            db.execute("INSERT INTO receipts(id,task_id,project_id,owner,body,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?)",(receipt_id,task_id,project_id,owner,body,now,idempotency_key))
+            db.execute("INSERT INTO receipts(id,task_id,project_id,owner,body,created_at,idempotency_key,request_hash) VALUES(?,?,?,?,?,?,?,?)",(receipt_id,task_id,project_id,owner,body,now,idempotency_key,request_hash))
             for lesson_id in receipt.get("lesson_ids",[]):
                 lesson=db.execute("SELECT status FROM lessons WHERE id=? AND project_id=?",(lesson_id,project_id)).fetchone()
                 if not lesson or lesson["status"]!="accepted": raise ValueError(f"Applied lesson {lesson_id!r} is not accepted in this project")
@@ -1245,9 +1471,18 @@ class MemoryStore:
             db.execute("UPDATE tasks SET status=?,blocked_reason=?,updated_at=?,owner=CASE WHEN ?='done' THEN '' ELSE owner END,lease_token=CASE WHEN ?='done' THEN '' ELSE lease_token END,lease_until=CASE WHEN ?='done' THEN 0 ELSE lease_until END WHERE id=?",(final_status,"" if final_status=="done" else "Acceptance evidence is missing or incomplete" if requested_done else row["blocked_reason"],now,final_status,final_status,final_status,task_id))
             db.commit()
         return {"receipt_id":receipt_id,"status":final_status,"duplicate":False,"completion_accepted":final_status=="done",
-                "note":("Done requires every acceptance check to include met=true and evidence." if requested_done and not all_met else
+                "acceptance_coverage":{"saved_count":len(saved_acceptance),"submitted_count":len(checks),"missing":missing_criteria,
+                    "duplicate_or_excess":duplicate_criteria,"unknown":unknown_criteria,"saved_revision":current_acceptance_revision,
+                    "submitted_revision":submitted_acceptance_revision,"revision_matches":acceptance_revision_matches,"complete":acceptance_covered},
+                "note":("Done requires checks matching every saved acceptance criterion exactly, without missing, duplicate, or unrelated entries; each must include met=true and evidence." if requested_done and not acceptance_covered else
                         "Done also requires the current requirements_revision and evidence-backed checks for every applicable current requirement." if requested_done and not requirements_met else
                         "Done also requires current approval for the linked approval-required proposal." if requested_done and not approval_met else "")}
+
+    @staticmethod
+    def _require_idempotency_key(key: Any) -> str:
+        if not isinstance(key,str) or not key.strip():
+            raise ValueError("idempotency_key is required and must be a non-empty string")
+        return key
 
     def release_task(self, project_id: str, task_id: str, owner: str, lease_token: str) -> dict[str, Any]:
         with self.connect(project_id) as db:
@@ -1258,41 +1493,93 @@ class MemoryStore:
             db.execute("UPDATE tasks SET owner='',lease_token='',lease_until=0,updated_at=? WHERE id=?",(time.time(),task_id)); db.commit()
         return self.get_task(project_id,task_id)
 
-    def propose_lesson(self, project_id: str, title: str, trigger_text: str, procedure: str, evidence: list[str] | None = None, outcome: str = "", source_task_id: str = "") -> dict[str, Any]:
+    def propose_lesson(self, project_id: str, title: str, trigger_text: str, procedure: str,
+                       evidence: list[str] | None = None, outcome: str = "", source_task_id: str = "",
+                       environment: dict[str, Any] | None = None, confirmed_cause: str = "",
+                       preconditions: list[str] | None = None, exclusions: list[dict[str, Any]] | None = None,
+                       hypotheses: list[str] | None = None) -> dict[str, Any]:
         self.get_project(project_id)
         if not title.strip() or not trigger_text.strip() or not procedure.strip(): raise ValueError("title, trigger_text, and procedure are required")
         if source_task_id:
             self.get_task(project_id,source_task_id)
             evidence=(evidence or [])+[f"task:{source_task_id}"]
+        environment=environment or {}; preconditions=preconditions or []; exclusions=exclusions or []; hypotheses=hypotheses or []
+        if not isinstance(environment,dict) or not isinstance(preconditions,list) or not all(isinstance(x,str) for x in preconditions) or not isinstance(exclusions,list) or not all(isinstance(x,dict) for x in exclusions) or not isinstance(hypotheses,list) or not all(isinstance(x,str) for x in hypotheses):
+            raise ValueError("environment must be an object; preconditions and hypotheses string lists; exclusions environment-object list")
         lesson_id=uuid.uuid4().hex[:12]
-        with self.connect(project_id) as db: db.execute("INSERT INTO lessons(id,project_id,title,trigger_text,procedure,evidence,outcome,status,updated_at) VALUES(?,?,?,?,?,?,?,'candidate',?)",(lesson_id,project_id,title.strip(),trigger_text.strip(),procedure.strip(),_json(evidence or []),outcome,time.time()))
+        with self.connect(project_id) as db:
+            db.execute("INSERT INTO lessons(id,project_id,title,trigger_text,procedure,evidence,outcome,status,updated_at,environment,confirmed_cause,preconditions,exclusions,source_task_id,hypotheses) VALUES(?,?,?,?,?,?,?,'candidate',?,?,?,?,?,?,?)",
+                (lesson_id,project_id,title.strip(),trigger_text.strip(),procedure.strip(),_json(evidence or []),outcome,time.time(),_json(environment),confirmed_cause.strip(),_json(preconditions),_json(exclusions),source_task_id,_json(hypotheses)))
         return self.get_lesson(project_id,lesson_id)
 
     def review_lesson(self, project_id: str, lesson_id: str, status: str, supersedes: str = "") -> dict[str, Any]:
-        if status not in {"accepted","rejected","superseded"}: raise ValueError("status must be accepted, rejected, or superseded")
+        if status not in {"candidate","accepted","rejected","superseded"}: raise ValueError("status must be candidate, accepted, rejected, or superseded")
         with self.connect(project_id) as db:
             row=db.execute("SELECT project_id FROM lessons WHERE id=?",(lesson_id,)).fetchone()
             if not row or row["project_id"]!=project_id: raise ValueError("Lesson not found in this project")
             if supersedes:
+                if supersedes==lesson_id: raise ValueError("A lesson cannot supersede itself")
                 old=db.execute("SELECT project_id FROM lessons WHERE id=?",(supersedes,)).fetchone()
                 if not old or old["project_id"]!=project_id: raise ValueError("Superseded lesson must be in this project")
+                seen={lesson_id}; cursor=supersedes
+                while cursor:
+                    if cursor in seen: raise ValueError("Lesson supersession would create a cycle")
+                    seen.add(cursor)
+                    parent=db.execute("SELECT supersedes FROM lessons WHERE id=? AND project_id=?",(cursor,project_id)).fetchone()
+                    cursor=parent["supersedes"] if parent else ""
+            if status=="superseded" and not supersedes: raise ValueError("superseded lessons must identify the replacement lesson")
             db.execute("UPDATE lessons SET status=?,supersedes=?,updated_at=? WHERE id=?",(status,supersedes,time.time(),lesson_id))
         return self.get_lesson(project_id,lesson_id)
 
     def get_lesson(self, project_id: str, lesson_id: str) -> dict[str, Any]:
         with self.connect(project_id) as db: row=db.execute("SELECT * FROM lessons WHERE id=? AND project_id=?",(lesson_id,project_id)).fetchone()
         if not row: raise ValueError("Lesson not found in this project")
-        out=dict(row); out["evidence"]=json.loads(out["evidence"]); return out
+        out=dict(row)
+        for field,default in (("evidence",[]),("environment",{}),("preconditions",[]),("exclusions",[]),("hypotheses",[])):
+            try: out[field]=json.loads(out[field])
+            except (TypeError,json.JSONDecodeError): out[field]=default
+        return out
 
-    def search_lessons(self, project_id: str, query: str, limit: int = 5) -> list[dict[str, Any]]:
+    def search_lessons(self, project_id: str, query: str, limit: int = 5,
+                       environment: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         self.get_project(project_id)
-        tokens={x.lower() for x in re.findall(r"[\w\u0080-\uffff]+",query)}
+        tokens={x.casefold() for x in re.findall(r"[\w\u0080-\uffff]+",query) if len(x)>1}
+        environment=environment or {}
+        if not isinstance(environment,dict): raise ValueError("environment must be an object")
         with self.connect(project_id) as db: rows=db.execute("SELECT * FROM lessons WHERE project_id=? AND status='accepted'",(project_id,)).fetchall()
-        def score(row: sqlite3.Row) -> int:
-            hay=(row["title"]+" "+row["trigger_text"]+" "+row["procedure"]).lower()
-            return sum(1 for t in tokens if t in hay)
-        ranked=sorted((r for r in rows if score(r)>0),key=lambda r:(-score(r),-r["updated_at"]))[:max(1,min(limit,10))]
-        return [{"id":r["id"],"title":r["title"],"trigger":r["trigger_text"],"procedure":r["procedure"],"evidence":json.loads(r["evidence"]),"updated_at":r["updated_at"]} for r in ranked]
+        ranked=[]
+        for row in rows:
+            item=dict(row)
+            for field,default in (("evidence",[]),("environment",{}),("preconditions",[]),("exclusions",[]),("hypotheses",[])):
+                try: item[field]=json.loads(item[field])
+                except (TypeError,json.JSONDecodeError): item[field]=default
+            hay={x.casefold() for x in re.findall(r"[\w\u0080-\uffff]+"," ".join([item["title"],item["trigger_text"],item["procedure"],item["outcome"],item["confirmed_cause"]," ".join(item["evidence"])])) if len(x)>1}
+            score=len(tokens & hay)
+            if not score: continue
+            required=item["environment"]
+            missing=sorted(set(required)-set(environment))
+            mismatches={key:{"expected":value,"actual":environment.get(key)} for key,value in required.items() if key in environment and environment[key]!=value}
+            excluded=[]; exclusion_missing=[]
+            for condition in item["exclusions"]:
+                absent=set(condition)-set(environment)
+                if absent: exclusion_missing.extend(sorted(absent))
+                elif all(environment.get(key)==value for key,value in condition.items()): excluded.append(condition)
+            if mismatches or excluded:
+                outcome="not_applicable"
+                reasons=[f"Environment mismatch for {key}: expected {values['expected']!r}, got {values['actual']!r}." for key,values in mismatches.items()]
+                if excluded: reasons.append("The supplied environment matches an explicit exclusion.")
+            elif missing or exclusion_missing or not required:
+                outcome="insufficient_information"; reasons=[]
+                if missing: reasons.append("Missing required environment fields: "+", ".join(missing)+".")
+                if exclusion_missing: reasons.append("Exclusion checks need: "+", ".join(sorted(set(exclusion_missing)))+".")
+                if not required: reasons.append("No structured environment conditions exist; keyword overlap alone cannot establish applicability.")
+            else:
+                outcome="applicable"; reasons=["All structured environment fields match and no explicit exclusion matches."]
+            item["relevance"]=score
+            item["applicability"]={"outcome":outcome,"reasons":reasons,"missing_information":sorted(set(missing+exclusion_missing))}
+            ranked.append(item)
+        ranked.sort(key=lambda item:(-item["relevance"],-item["updated_at"],item["id"]))
+        return ranked[:max(1,min(limit,20))]
 
     # Requirements are normative project constraints. Their lifecycle (current,
     # superseded, withdrawn, proposed) is deliberately independent of fulfillment.
@@ -1406,6 +1693,24 @@ class MemoryStore:
                 return {"project_id": project_id, "kind": kind, "path": str(destination), "revision": revision, "record_count": count, "sha256": digest}
         raise RuntimeError("Project records changed repeatedly while rendering the projection; retry the sync")
 
+    def _finish_record_write(self, project_id: str, kind: str, record_id: str, revision: int,
+                              record: dict[str, Any]) -> dict[str, Any]:
+        record["record_committed"]=True
+        record["record_revision"]=revision
+        try:
+            projection=self.sync_records_projection(project_id,kind)
+            record["projection_status"]={"status":"synced","revision":projection["revision"],"path":f"@memory/{kind}.md"}
+            record["recovery"]=""
+        except Exception:
+            # The database transaction has already committed. Keep that success
+            # visible and provide a safe read/retry path without exposing local
+            # filesystem paths or exception internals in the caller response.
+            record["projection_status"]={"status":"failed","record_committed":True,
+                "record_id":record_id,"record_revision":revision,"error_code":"projection_sync_failed",
+                "recovery":"Read the record by ID, preserve manual projection edits, then call the matching projection sync action."}
+            record["recovery"]=record["projection_status"]["recovery"]
+        return record
+
     def _record_write(self, db: sqlite3.Connection, project_id: str, kind: str, record_id: str, revision: int,
                       snapshot: dict[str, Any], action: str, note: str, source_type: str, source_ref: str,
                       idempotency_key: str, request_hash: str) -> None:
@@ -1422,14 +1727,14 @@ class MemoryStore:
         self.get_project(project_id)
         if not title.strip() or not statement.strip(): raise ValueError("title and statement are required")
         if lifecycle not in self._REQUIREMENT_LIFECYCLES or fulfillment not in self._FULFILLMENT_STATES: raise ValueError("invalid requirement lifecycle or fulfillment")
-        if not idempotency_key.strip(): raise ValueError("idempotency_key is required")
+        self._require_idempotency_key(idempotency_key)
         data = {"title": title.strip(), "kind": kind.strip() or "behavior", "statement": statement.strip(), "original_quote": original_quote,
                 "interpretation": interpretation, "lifecycle": lifecycle, "fulfillment": fulfillment,
                 "scope": self._scope_value(scope), "rationale": rationale, "criteria": criteria or [],
                 "fulfillment_evidence": fulfillment_evidence or [], "source_type": source_type, "source_ref": source_ref,
                 "source_date": source_date, "supersedes_id": supersedes_id}
         if fulfillment in {"fulfilled", "regressed", "waived"} and not data["fulfillment_evidence"]: raise ValueError("fulfilled, regressed, and waived states require evidence")
-        request_hash = hashlib.sha256(_json(data).encode()).hexdigest()
+        request_hash = _request_hash(data)
         now = time.time()
         with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1445,8 +1750,7 @@ class MemoryStore:
             self._record_write(db, project_id, "requirement", record_id, 1, snapshot, "created", change_note, source_type, source_ref, idempotency_key, request_hash)
             self._record_revision(db, project_id, "requirement")
             db.commit()
-        self.sync_records_projection(project_id, "requirements")
-        return self.get_requirement(project_id, record_id)
+        return self._finish_record_write(project_id,"requirements",record_id,1,self.get_requirement(project_id,record_id))
 
     def get_requirement(self, project_id: str, requirement_id: str) -> dict[str, Any]:
         with self.connect(project_id) as db: row = db.execute("SELECT * FROM requirements WHERE project_id=? AND id=?", (project_id, requirement_id)).fetchone()
@@ -1468,6 +1772,7 @@ class MemoryStore:
 
     def update_requirement(self, project_id: str, requirement_id: str, *, expected_revision: int,
                            idempotency_key: str, change_note: str = "", **changes: Any) -> dict[str, Any]:
+        self._require_idempotency_key(idempotency_key)
         allowed = {"title","kind","statement","original_quote","interpretation","lifecycle","fulfillment","scope","rationale","criteria","fulfillment_evidence","source_type","source_ref","source_date","supersedes_id"}
         if not changes or set(changes)-allowed: raise ValueError("provide only supported requirement fields")
         with self.connect(project_id) as db:
@@ -1476,15 +1781,32 @@ class MemoryStore:
             if not row: raise ValueError("Requirement not found in this project")
             existing = dict(row)
             old = db.execute("SELECT request_hash FROM requirement_history WHERE project_id=? AND idempotency_key=?", (project_id,idempotency_key)).fetchone()
-            request_hash = hashlib.sha256(_json({"requirement_id":requirement_id,"expected_revision":expected_revision,"changes":changes}).encode()).hexdigest()
+            request_hash = _request_hash({"requirement_id":requirement_id,"expected_revision":expected_revision,"changes":changes})
             if old:
                 if old["request_hash"] != request_hash: raise ValueError("idempotency_key was already used with different update content")
                 db.commit(); return self.get_requirement(project_id,requirement_id)
             if int(existing["revision"]) != int(expected_revision): raise ValueError(f"revision conflict: expected {expected_revision}, current is {existing['revision']}")
             values = {k: changes.get(k, existing[k]) for k in allowed}
             if values["lifecycle"] not in self._REQUIREMENT_LIFECYCLES or values["fulfillment"] not in self._FULFILLMENT_STATES: raise ValueError("invalid lifecycle or fulfillment")
+            supersedes=values["supersedes_id"]
+            if supersedes:
+                if supersedes==requirement_id: raise ValueError("A requirement cannot supersede itself")
+                target=db.execute("SELECT id FROM requirements WHERE project_id=? AND id=?",(project_id,supersedes)).fetchone()
+                if not target: raise ValueError("supersedes_id must identify an existing requirement in this project")
+                seen={requirement_id}; cursor=supersedes
+                while cursor:
+                    if cursor in seen: raise ValueError("Requirement supersession would create a cycle")
+                    seen.add(cursor)
+                    parent=db.execute("SELECT supersedes_id FROM requirements WHERE project_id=? AND id=?",(project_id,cursor)).fetchone()
+                    if not parent: raise ValueError("Requirement supersession graph references a missing target; repair the existing graph before updating")
+                    cursor=parent["supersedes_id"]
             if values["lifecycle"]=="superseded" and not db.execute("SELECT 1 FROM requirements WHERE project_id=? AND supersedes_id=? AND lifecycle='current'",(project_id,requirement_id)).fetchone(): raise ValueError("Create a current replacement requirement with supersedes_id pointing here before superseding this record")
-            if values["fulfillment"] in {"fulfilled","regressed","waived"} and not (values["fulfillment_evidence"] or json.loads(existing["fulfillment_evidence"])): raise ValueError("fulfilled, regressed, and waived states require evidence")
+            evidence=values["fulfillment_evidence"]
+            if isinstance(evidence,str):
+                try: evidence=json.loads(evidence)
+                except json.JSONDecodeError: evidence=[]
+            if values["fulfillment"] in {"fulfilled","regressed","waived"} and (not isinstance(evidence,list) or not any(isinstance(x,str) and x.strip() for x in evidence)):
+                raise ValueError("fulfilled, regressed, and waived states require non-empty evidence in the resulting record")
             scope = self._scope_value(values["scope"] if isinstance(values["scope"],dict) else json.loads(values["scope"]))
             vals = dict(values); vals["scope"] = _json(scope)
             for fld in ("criteria","fulfillment_evidence"):
@@ -1496,8 +1818,7 @@ class MemoryStore:
             snapshot = self._row_json(db.execute("SELECT * FROM requirements WHERE id=?",(requirement_id,)).fetchone(),("scope","criteria","fulfillment_evidence"))
             self._record_write(db,project_id,"requirement",requirement_id,nextrev,snapshot,"updated",change_note,vals["source_type"],vals["source_ref"],idempotency_key,request_hash)
             self._record_revision(db,project_id,"requirement"); db.commit()
-        self.sync_records_projection(project_id,"requirements")
-        return self.get_requirement(project_id,requirement_id)
+        return self._finish_record_write(project_id,"requirements",requirement_id,nextrev,self.get_requirement(project_id,requirement_id))
 
     def create_decision(self, project_id: str, title: str, choice: str, *, rationale: str = "", alternatives: list[str] | None = None,
                         scope: dict[str, Any] | None = None, status: str = "current", source_type: str = "", source_ref: str = "",
@@ -1505,10 +1826,11 @@ class MemoryStore:
                         supersedes_id: str = "", idempotency_key: str = "", change_note: str = "") -> dict[str, Any]:
         self.get_project(project_id)
         if not title.strip() or not choice.strip(): raise ValueError("title and choice are required")
-        if status not in self._DECISION_STATUSES or not idempotency_key.strip(): raise ValueError("invalid status or missing idempotency_key")
+        self._require_idempotency_key(idempotency_key)
+        if status not in self._DECISION_STATUSES: raise ValueError("invalid status")
         scope_data=self._scope_value(scope); reqs=list(dict.fromkeys(requirement_ids or []))
         payload={"title":title.strip(),"choice":choice.strip(),"rationale":rationale,"alternatives":alternatives or [],"scope":scope_data,"status":status,"source_type":source_type,"source_ref":source_ref,"source_date":source_date,"original_quote":original_quote,"revisit_when":revisit_when,"requirement_ids":reqs,"supersedes_id":supersedes_id}
-        request_hash=hashlib.sha256(_json(payload).encode()).hexdigest(); now=time.time()
+        request_hash=_request_hash(payload); now=time.time()
         with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             old=db.execute("SELECT decision_id,request_hash FROM decision_history WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
@@ -1524,8 +1846,7 @@ class MemoryStore:
             snapshot=self._row_json(db.execute("SELECT * FROM decisions WHERE id=?",(did,)).fetchone(),("scope","alternatives")) | {"requirement_ids":reqs}
             self._record_write(db,project_id,"decision",did,1,snapshot,"created",change_note,source_type,source_ref,idempotency_key,request_hash)
             self._record_revision(db,project_id,"decision"); db.commit()
-        self.sync_records_projection(project_id,"decisions")
-        return self.get_decision(project_id,did)
+        return self._finish_record_write(project_id,"decisions",did,1,self.get_decision(project_id,did))
 
     def get_decision(self, project_id: str, decision_id: str) -> dict[str, Any]:
         with self.connect(project_id) as db:
@@ -1550,13 +1871,13 @@ class MemoryStore:
                         change_note: str = "", requirement_ids: list[str] | None = None, **changes: Any) -> dict[str, Any]:
         allowed={"title","choice","rationale","alternatives","scope","status","source_type","source_ref","source_date","original_quote","revisit_when","supersedes_id"}
         if not changes or set(changes)-allowed: raise ValueError("provide only supported decision fields")
-        if not idempotency_key.strip(): raise ValueError("idempotency_key is required")
+        self._require_idempotency_key(idempotency_key)
         with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             row=db.execute("SELECT * FROM decisions WHERE project_id=? AND id=?",(project_id,decision_id)).fetchone()
             if not row: raise ValueError("Decision not found in this project")
             existing=dict(row)
-            request_hash=hashlib.sha256(_json({"decision_id":decision_id,"expected_revision":expected_revision,"changes":changes,"requirement_ids":requirement_ids}).encode()).hexdigest()
+            request_hash=_request_hash({"decision_id":decision_id,"expected_revision":expected_revision,"changes":changes,"requirement_ids":requirement_ids})
             prior=db.execute("SELECT request_hash FROM decision_history WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
             if prior:
                 if prior["request_hash"]!=request_hash: raise ValueError("idempotency_key was already used with different decision content")
@@ -1578,8 +1899,7 @@ class MemoryStore:
             snapshot=self._row_json(db.execute("SELECT * FROM decisions WHERE id=?",(decision_id,)).fetchone(),("scope","alternatives"))|{"requirement_ids":reqs}
             self._record_write(db,project_id,"decision",decision_id,nextrev,snapshot,"updated",change_note,values["source_type"],values["source_ref"],idempotency_key,request_hash)
             self._record_revision(db,project_id,"decision"); db.commit()
-        self.sync_records_projection(project_id,"decisions")
-        return self.get_decision(project_id,decision_id)
+        return self._finish_record_write(project_id,"decisions",decision_id,nextrev,self.get_decision(project_id,decision_id))
 
     # Proposals preserve the exact material a user reviews. Approval events pin
     # both that proposal revision and immutable snapshots of its linked records.
@@ -1641,6 +1961,10 @@ class MemoryStore:
             proposal_snapshot=json.loads(latest["proposal_snapshot"])
             latest["target_snapshots"]=[{"kind":t["kind"],"id":t["id"],"revision":t["revision"],"snapshot_sha256":t["snapshot_sha256"]} for t in target_snapshots]
             latest["proposal_snapshot"]={"title":proposal_snapshot.get("title",""),"revision":latest["proposal_revision"],"content_sha256":latest["proposal_sha256"]}
+            quote=latest.pop("original_quote","")
+            latest["original_quote_summary"]={"included":False,"characters":len(quote),
+                "sha256":hashlib.sha256(quote.encode("utf-8")).hexdigest(),
+                "available_from":"proposals(action='approval-history')","event_id":latest.get("event_id")}
             latest["full_snapshot_in_history"]=True
         return {"proposal_id":proposal_id,"status":status,"approval_required":bool(row["approval_required"]),
                 "proposal_revision":row["revision"],"proposal_sha256":row["content_sha256"],
@@ -1658,10 +1982,10 @@ class MemoryStore:
                         source_date: str = "", created_by: str = "agent", idempotency_key: str = "") -> dict[str, Any]:
         if not title.strip() or not content.strip(): raise ValueError("title and content are required")
         if len(content.encode("utf-8"))>MAX_PROPOSAL_BYTES: raise ValueError(f"proposal content exceeds {MAX_PROPOSAL_BYTES} bytes")
-        if not idempotency_key.strip(): raise ValueError("idempotency_key is required")
+        self._require_idempotency_key(idempotency_key)
         self.get_project(project_id)
         now=time.time(); normalized={"title":title.strip(),"content":content,"approval_required":bool(approval_required),"source_type":source_type,"source_ref":source_ref,"source_date":source_date,"created_by":created_by.strip() or "agent","targets":targets or []}
-        request_hash=hashlib.sha256(_json(normalized).encode("utf-8")).hexdigest()
+        request_hash=_request_hash(normalized)
         with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             prior=db.execute("SELECT proposal_id,request_hash FROM proposal_history WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
@@ -1676,8 +2000,7 @@ class MemoryStore:
             snap=dict(db.execute("SELECT * FROM proposals WHERE id=?",(proposal_id,)).fetchone()); snap["targets"]=target_snapshots
             db.execute("INSERT INTO proposal_history(project_id,proposal_id,revision,snapshot,action,change_note,idempotency_key,request_hash,recorded_at) VALUES(?,?,1,?,'created','',?,?,?)",(project_id,proposal_id,_json(snap),idempotency_key,request_hash,now))
             self._record_revision(db,project_id,"approval"); db.commit()
-        self.sync_records_projection(project_id,"approvals")
-        return self.get_proposal(project_id,proposal_id)
+        return self._finish_record_write(project_id,"approvals",proposal_id,1,self.get_proposal(project_id,proposal_id))
 
     def get_proposal(self, project_id: str, proposal_id: str) -> dict[str, Any]:
         with self.connect(project_id) as db:
@@ -1702,7 +2025,7 @@ class MemoryStore:
                         title: str | None = None, content: str | None = None, targets: list[dict[str, Any]] | None = None,
                         approval_required: bool | None = None, source_type: str = "", source_ref: str = "",
                         source_date: str = "", change_note: str = "") -> dict[str, Any]:
-        if not idempotency_key.strip(): raise ValueError("idempotency_key is required")
+        self._require_idempotency_key(idempotency_key)
         now=time.time()
         with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1714,7 +2037,7 @@ class MemoryStore:
                      "source_type":source_type or existing["source_type"],"source_ref":source_ref or existing["source_ref"],"source_date":source_date or existing["source_date"]}
             if not payload["title"].strip() or not payload["content"].strip(): raise ValueError("title and content are required")
             if len(payload["content"].encode("utf-8"))>MAX_PROPOSAL_BYTES: raise ValueError(f"proposal content exceeds {MAX_PROPOSAL_BYTES} bytes")
-            request_hash=hashlib.sha256(_json({"proposal_id":proposal_id,"expected_revision":expected_revision,"payload":payload}).encode("utf-8")).hexdigest()
+            request_hash=_request_hash({"proposal_id":proposal_id,"expected_revision":expected_revision,"payload":payload})
             prior=db.execute("SELECT request_hash FROM proposal_history WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
             if prior:
                 if prior["request_hash"]!=request_hash: raise ValueError("idempotency_key was already used with different proposal content")
@@ -1727,17 +2050,17 @@ class MemoryStore:
             snap=dict(db.execute("SELECT * FROM proposals WHERE project_id=? AND id=?",(project_id,proposal_id)).fetchone()); snap["targets"]=target_snapshots
             db.execute("INSERT INTO proposal_history(project_id,proposal_id,revision,snapshot,action,change_note,idempotency_key,request_hash,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",(project_id,proposal_id,next_revision,_json(snap),"updated",change_note,idempotency_key,request_hash,now))
             self._record_revision(db,project_id,"approval"); db.commit()
-        self.sync_records_projection(project_id,"approvals")
-        return self.get_proposal(project_id,proposal_id)
+        return self._finish_record_write(project_id,"approvals",proposal_id,next_revision,self.get_proposal(project_id,proposal_id))
 
     def _record_approval_event(self, project_id: str, proposal_id: str, decision: str, *, expected_revision: int,
                                original_quote: str, source_type: str, source_ref: str, source_date: str,
                                recorded_by: str, idempotency_key: str, target_event_id: str = "") -> dict[str, Any]:
         if decision not in {"approved","rejected","withdrawn"}: raise ValueError("decision must be approved, rejected, or withdrawn")
-        if not all(x.strip() for x in (original_quote,source_type,source_ref,recorded_by,idempotency_key)):
+        self._require_idempotency_key(idempotency_key)
+        if not all(isinstance(x,str) and x.strip() for x in (original_quote,source_type,source_ref,recorded_by)):
             raise ValueError("approval wording, source_type, source_ref, recorded_by, and idempotency_key are required")
         now=time.time(); request={"proposal_id":proposal_id,"decision":decision,"expected_revision":expected_revision,"original_quote":original_quote,"source_type":source_type,"source_ref":source_ref,"source_date":source_date,"recorded_by":recorded_by,"target_event_id":target_event_id}
-        request_hash=hashlib.sha256(_json(request).encode("utf-8")).hexdigest()
+        request_hash=_request_hash(request)
         with self.connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             prior=db.execute("SELECT * FROM approval_events WHERE project_id=? AND idempotency_key=?",(project_id,idempotency_key)).fetchone()
@@ -1769,8 +2092,7 @@ class MemoryStore:
                        (event_id,project_id,proposal_id,pinned_revision,pinned_hash,_json(proposal_snapshot),_json(targets),decision,original_quote,source_type,source_ref,source_date or "unknown",recorded_by,target_event_id,idempotency_key,request_hash,now))
             self._record_revision(db,project_id,"approval"); db.commit()
             result=dict(db.execute("SELECT * FROM approval_events WHERE event_id=?",(event_id,)).fetchone()); result["target_snapshots"]=targets; result["proposal_snapshot"]=proposal_snapshot
-        self.sync_records_projection(project_id,"approvals")
-        return result
+        return self._finish_record_write(project_id,"approvals",proposal_id,expected_revision,result)
 
     def approve_proposal(self, project_id: str, proposal_id: str, *, expected_revision: int,
                          original_quote: str, source_type: str, source_ref: str, source_date: str = "unknown",
@@ -1837,12 +2159,27 @@ class MemoryStore:
             linked={r["requirement_id"]:r for r in db.execute("SELECT tr.requirement_id,tr.requirement_revision,tr.acceptance,r.revision AS current_revision,r.lifecycle FROM task_requirement_links tr LEFT JOIN requirements r ON r.id=tr.requirement_id AND r.project_id=? WHERE tr.task_id=?",(project_id,task["id"]))}
             parents={r["id"]:r["supersedes_id"] for r in db.execute("SELECT id,supersedes_id FROM requirements WHERE project_id=?",(project_id,))}
             proposal_rows=db.execute("SELECT id,scope FROM requirements WHERE project_id=? AND lifecycle='proposed'",(project_id,)).fetchall()
+        checked=set()
+        for start in parents:
+            cursor=start; current_path=set()
+            while cursor and cursor not in checked:
+                if cursor in current_path:
+                    raise ValueError(f"Requirement supersession graph contains a cycle near {cursor!r}; repair supersedes_id before task retrieval")
+                current_path.add(cursor)
+                parent=parents.get(cursor,"")
+                if parent and parent not in parents:
+                    raise ValueError(f"Requirement supersession graph references missing target {parent!r}; repair supersedes_id before task retrieval")
+                cursor=parent
+            checked.update(current_path)
         applicable=[]; proposed=[]; review=[]
         for row in rows:
             r=self._row_json(row,("scope","criteria","fulfillment_evidence")); scope=r["scope"]
             if scope.get("condition_state")=="inactive": continue
-            ancestor=r["id"]; linked_ancestor=""
+            ancestor=r["id"]; linked_ancestor=""; seen_ancestors=set()
             while ancestor and ancestor not in linked:
+                if ancestor in seen_ancestors:
+                    raise ValueError(f"Requirement supersession graph contains a cycle near {ancestor!r}; repair supersedes_id before task retrieval")
+                seen_ancestors.add(ancestor)
                 ancestor=parents.get(ancestor,"")
             if ancestor in linked: linked_ancestor=ancestor
             explicit=bool(linked_ancestor)
@@ -1897,6 +2234,7 @@ class MemoryStore:
             receipts=[dict(x) for x in db.execute("SELECT * FROM receipts WHERE project_id=?",(project_id,))]
             lesson_uses=[dict(x) for x in db.execute("SELECT u.* FROM lesson_uses u JOIN lessons l ON l.id=u.lesson_id WHERE l.project_id=?",(project_id,))]
             deps=[dict(x) for x in db.execute("SELECT d.* FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.project_id=?",(project_id,))]
+            task_acceptance_history=[dict(x)|{"criteria":json.loads(x["criteria"])} for x in db.execute("SELECT * FROM task_acceptance_history WHERE project_id=? ORDER BY task_id,revision",(project_id,))]
             requirements=[self._row_json(x,("scope","criteria","fulfillment_evidence")) for x in db.execute("SELECT * FROM requirements WHERE project_id=?",(project_id,))]
             requirement_history=[dict(x)|{"snapshot":json.loads(x["snapshot"])} for x in db.execute("SELECT * FROM requirement_history WHERE project_id=?",(project_id,))]
             decisions=[self._row_json(x,("scope","alternatives")) for x in db.execute("SELECT * FROM decisions WHERE project_id=?",(project_id,))]
@@ -1907,10 +2245,100 @@ class MemoryStore:
             proposal_history=[dict(x)|{"snapshot":json.loads(x["snapshot"])} for x in db.execute("SELECT * FROM proposal_history WHERE project_id=? ORDER BY id",(project_id,))]
             approval_events=[dict(x)|{"target_snapshots":json.loads(x["target_snapshots"]),"proposal_snapshot":json.loads(x["proposal_snapshot"])} for x in db.execute("SELECT * FROM approval_events WHERE project_id=? ORDER BY id",(project_id,))]
             record_revisions=dict(db.execute("SELECT requirements_revision,decisions_revision,approvals_revision FROM project_record_revisions WHERE project_id=?",(project_id,)).fetchone() or {})
-        return {"schema_version":4,"exported_at":time.time(),"project":project,"tasks":tasks,"dependencies":deps,"receipts":receipts,"lessons":lessons,"lesson_uses":lesson_uses,
+        return {"schema_version":6,"exported_at":time.time(),"project":project,"tasks":tasks,"task_acceptance_history":task_acceptance_history,"dependencies":deps,"receipts":receipts,"lessons":lessons,"lesson_uses":lesson_uses,
                 "requirements":requirements,"requirement_history":requirement_history,"decisions":decisions,"decision_history":decision_history,
                 "decision_requirements":decision_requirements,"task_requirement_links":task_requirement_links,"proposals":proposals,
                 "proposal_history":proposal_history,"approval_events":approval_events,"record_revisions":record_revisions,"knowledge_manifest":knowledge_manifest}
+
+    def import_project(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Restore structured records from an AgentMem export into an empty same-project ledger."""
+        project=self.get_project(project_id)
+        if not isinstance(payload,dict) or payload.get("schema_version") not in {4,5,6}:
+            raise ValueError("AgentMem import requires a schema_version 4, 5, or 6 export object")
+        source_project=payload.get("project")
+        if not isinstance(source_project,dict) or source_project.get("id")!=project_id:
+            raise ValueError("Import project ID must exactly match the registered destination project")
+        if Path(source_project.get("root","")).expanduser().resolve()!=Path(project["root"]).resolve():
+            raise ValueError("Import source root must match the destination's registered source root")
+        encoded=_json(payload)
+        if len(encoded.encode("utf-8"))>50_000_000:
+            raise ValueError("AgentMem import exceeds the 50 MB safety limit")
+        arrays=("tasks","task_acceptance_history","dependencies","receipts","lessons","lesson_uses","requirements","requirement_history",
+                "decisions","decision_history","decision_requirements","task_requirement_links","proposals",
+                "proposal_history","approval_events")
+        for key in arrays:
+            if not isinstance(payload.get(key,[]),list) or not all(isinstance(row,dict) for row in payload.get(key,[])):
+                raise ValueError(f"Import field {key!r} must be an array of records")
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            protected_tables=("tasks","task_acceptance_history","dependencies","receipts","lessons","lesson_uses","requirements","requirement_history",
+                "decisions","decision_history","decision_requirements","task_requirement_links","proposals","proposal_history","approval_events")
+            counts={table:int(db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]) for table in protected_tables}
+            if any(counts.values()):
+                db.rollback()
+                raise ValueError("Import destination already contains project records; import is restricted to an empty project ledger")
+
+            json_columns={
+                "tasks":{"acceptance","authorized_paths","checkpoint","components"},"task_acceptance_history":{"criteria"},
+                "receipts":{"body"},"lessons":{"evidence","environment","preconditions","exclusions","hypotheses"},
+                "requirements":{"scope","criteria","fulfillment_evidence"},
+                "requirement_history":{"snapshot"},"decisions":{"alternatives","scope"},
+                "decision_history":{"snapshot"},"proposals":{"targets"},"proposal_history":{"snapshot"},
+                "approval_events":{"proposal_snapshot","target_snapshots"},
+            }
+            inserted={}
+            ordered=("tasks","task_acceptance_history","requirements","decisions","proposals","dependencies","receipts","lessons","lesson_uses",
+                     "requirement_history","decision_history","decision_requirements","task_requirement_links","proposal_history","approval_events")
+            for table in ordered:
+                rows=payload.get(table,[])
+                columns={r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+                count=0
+                for source in rows:
+                    row=dict(source)
+                    if "project_id" in row and row["project_id"] not in {None,project_id}:
+                        db.rollback(); raise ValueError(f"Record in {table!r} belongs to a different project")
+                    row["project_id"]=project_id if "project_id" in columns else row.get("project_id")
+                    for field in json_columns.get(table,set()):
+                        if field in row and not isinstance(row[field],str): row[field]=_json(row[field])
+                    if table=="tasks":
+                        row["owner"]=""; row["lease_token"]=""; row["lease_until"]=0
+                    if table=="receipts" and not row.get("request_hash"):
+                        try: row["request_hash"]=_request_hash(json.loads(row["body"]))
+                        except (KeyError,AttributeError,TypeError,json.JSONDecodeError): row["request_hash"]=""
+                    row={key:value for key,value in row.items() if key in columns}
+                    if not row:
+                        db.rollback(); raise ValueError(f"Record in {table!r} has no recognized columns")
+                    names=list(row)
+                    db.execute(f"INSERT INTO {table}({','.join(names)}) VALUES({','.join('?' for _ in names)})",[row[name] for name in names])
+                    count+=1
+                inserted[table]=count
+            # Backward-compatible v4/v5 exports predate acceptance history.
+            for task in db.execute("SELECT id,acceptance,acceptance_revision FROM tasks WHERE project_id=?",(project_id,)).fetchall():
+                if not db.execute("SELECT 1 FROM task_acceptance_history WHERE task_id=?",(task["id"],)).fetchone():
+                    criteria=json.loads(task["acceptance"]); rev=int(task["acceptance_revision"] or 1)
+                    self._record_task_acceptance(db,task["id"],project_id,rev,criteria,"Restored from legacy export","legacy_import","", "",f"legacy-import:{task['id']}:{rev}")
+            revisions=payload.get("record_revisions",{})
+            if not isinstance(revisions,dict):
+                db.rollback(); raise ValueError("record_revisions must be an object")
+            db.execute("INSERT OR REPLACE INTO project_record_revisions(project_id,requirements_revision,decisions_revision,approvals_revision) VALUES(?,?,?,?)",
+                (project_id,int(revisions.get("requirements_revision",0)),int(revisions.get("decisions_revision",0)),int(revisions.get("approvals_revision",0))))
+            for kind,prefix,table in (("requirement","REQ","requirements"),("decision","DEC","decisions"),("proposal","PRP","proposals")):
+                ids=[row["id"] for row in payload.get(table,[]) if isinstance(row.get("id"),str)]
+                values=[int(m.group(1)) for value in ids if (m:=re.fullmatch(prefix+r"-(\d+)",value))]
+                db.execute("INSERT OR REPLACE INTO record_counters(project_id,kind,next_value) VALUES(?,?,?)",(project_id,kind,max(values,default=0)+1))
+            db.commit()
+        projection_status={}
+        for kind in ("requirements","decisions","approvals"):
+            try:
+                self.sync_records_projection(project_id,kind)
+                projection_status[kind]="synced"
+            except Exception:
+                projection_status[kind]="failed; retry its sync action after reading the restored records"
+        return {"project_id":project_id,"record_committed":True,"record_counts":inserted,
+                "projection_status":projection_status,"derived_index_imported":False,
+                "knowledge_pages_imported":False,
+                "next_steps":["Copy Markdown page files from the corresponding file backup if needed.","Run index_project to rebuild source evidence and confirm freshness."],
+                "note":"Import preserves structured records and histories. It clears task leases. Search chunks and Markdown bodies are not part of the JSON export."}
 
     def update_project_brief(self, project_id: str, markdown: str) -> dict[str, Any]:
         project = self.get_project(project_id)
@@ -1989,10 +2417,20 @@ class MemoryStore:
             raise ValueError(f"Knowledge page {page_id!r} exceeds the {MAX_KNOWLEDGE_PAGE_BYTES}-byte limit")
         digest=hashlib.sha256(content.encode("utf-8")).hexdigest()
         first_heading=next((line[2:].strip() for line in content.splitlines() if line.startswith("# ")),page_id.replace("-"," ").title())
+        paragraphs=[]; current=[]
+        for line in content.splitlines():
+            if not line.strip():
+                if current: paragraphs.append(" ".join(current)); current=[]
+                continue
+            if line.startswith("#") or line.startswith("<!--") or line.strip().lower().startswith("not documented yet"):
+                continue
+            current.append(line.strip())
+        if current: paragraphs.append(" ".join(current))
+        description=next((p[:280] for p in paragraphs if p),"")
         with self.connect(project_id) as db:
             indexed=db.execute("SELECT sha256,indexed_at FROM sources WHERE project_id=? AND relpath=?",(project_id,f"@memory/knowledge/{page_id}.md")).fetchone()
         stat=path.stat()
-        return {"page_id":page_id,"title":first_heading,"path":f"@memory/knowledge/{page_id}.md","citation":f"@memory/knowledge/{page_id}.md#L1",
+        return {"page_id":page_id,"title":first_heading,"description":description,"path":f"@memory/knowledge/{page_id}.md","citation":f"@memory/knowledge/{page_id}.md#L1",
                 "sha256":digest,"indexed_sha256":indexed["sha256"] if indexed else "","fresh":bool(indexed and indexed["sha256"]==digest),
                 "indexed_at":indexed["indexed_at"] if indexed else None,"bytes":stat.st_size,"lines":len(content.splitlines()),"modified_at":stat.st_mtime}
 
@@ -2037,7 +2475,8 @@ class MemoryStore:
         return {"project_id":project_id,"directory":"@memory/knowledge/","count":len(ids),"offset":offset,"limit":limit,
                 "next_offset":offset+len(items) if offset+len(items)<len(ids) else None,"unindexed_count":sum(not x["fresh"] for x in items),"pages":items}
 
-    def read_knowledge_page(self, project_id: str, page_id: str, max_chars: int = MAX_KNOWLEDGE_OUTPUT_CHARS, history_id: str = "") -> dict[str, Any]:
+    def read_knowledge_page(self, project_id: str, page_id: str, max_chars: int = MAX_KNOWLEDGE_OUTPUT_CHARS,
+                            history_id: str = "", content_offset: int = 0) -> dict[str, Any]:
         page_id=self._knowledge_page_id(page_id)
         directory=self._knowledge_directory(project_id,create=False)
         current=directory/f"{page_id}.md"
@@ -2061,9 +2500,18 @@ class MemoryStore:
         if len(content.encode("utf-8"))>MAX_KNOWLEDGE_PAGE_BYTES:
             raise ValueError(f"Knowledge page exceeds the {MAX_KNOWLEDGE_PAGE_BYTES}-byte limit")
         digest=hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if content_offset<0 or content_offset>len(content): raise ValueError("content_offset must point within the page")
         max_chars=min(max(int(max_chars),1000),MAX_KNOWLEDGE_OUTPUT_CHARS)
-        return {"project_id":project_id,"page_id":page_id,"history_id":history_id,"path":str(path) if history_id else f"@memory/knowledge/{page_id}.md",
-                "sha256":digest,"content":content[:max_chars],"content_truncated":len(content)>max_chars,"characters":len(content)}
+        excerpt=content[content_offset:content_offset+max_chars]
+        end_offset=content_offset+len(excerpt)
+        start_line=content.count("\n",0,content_offset)+1
+        end_line=content.count("\n",0,end_offset)+1 if excerpt else start_line
+        truncated=end_offset<len(content)
+        citation_path=f"@memory/knowledge/.history/{page_id}/{history_id}.md" if history_id else f"@memory/knowledge/{page_id}.md"
+        return {"project_id":project_id,"page_id":page_id,"history_id":history_id,"path":citation_path,
+                "citation":f"{citation_path}#L{start_line}-L{end_line}","sha256":digest,"content":excerpt,
+                "content_offset":content_offset,"next_content_offset":end_offset if truncated else None,
+                "content_complete":not truncated,"content_truncated":truncated,"characters":len(content)}
 
     def knowledge_page_history(self, project_id: str, page_id: str, limit: int = 20) -> dict[str, Any]:
         page_id=self._knowledge_page_id(page_id)
@@ -2130,3 +2578,42 @@ class MemoryStore:
             indexed=self._index_file(db,project_id,f"@memory/knowledge/{page_id}.md",path,time.time())
             db.commit()
         return self._knowledge_page_metadata(project_id,page_id,path)|{"updated":True,"history_id":history_id,"prior_sha256":current_hash,"indexed":True,"content_changed":indexed,"source_revision":self.source_revision(project_id)}
+
+    def delete_knowledge_page(self, project_id: str, page_id: str, expected_sha256: str) -> dict[str, Any]:
+        """Remove a current page and its search entry while retaining an auditable history copy."""
+        page_id=self._knowledge_page_id(page_id)
+        if not isinstance(expected_sha256,str) or not re.fullmatch(r"[a-f0-9]{64}",expected_sha256):
+            raise ValueError("expected_sha256 from knowledge read is required")
+        path=self._knowledge_page_path(project_id,page_id)
+        if not path.is_file(): raise ValueError(f"Unknown knowledge page {page_id!r}")
+        history_parent=path.parent/".history"
+        if history_parent.is_symlink() or getattr(history_parent,"is_junction",lambda:False)():
+            raise ValueError("Knowledge history cannot be a symlink or junction")
+        with self.connect(project_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            current=path.read_text(encoding="utf-8")
+            current_hash=hashlib.sha256(current.encode("utf-8")).hexdigest()
+            if current_hash!=expected_sha256:
+                db.rollback(); raise ValueError("Knowledge page changed since it was read; reread before deleting")
+            history_dir=history_parent/page_id
+            if history_dir.is_symlink() or getattr(history_dir,"is_junction",lambda:False)():
+                db.rollback(); raise ValueError("Knowledge history path is unsafe")
+            history_dir.mkdir(parents=True,exist_ok=True)
+            history_id=f"{int(time.time()*1000)}-{current_hash[:12]}"
+            backup=history_dir/f"{history_id}.md"
+            if backup.exists(): history_id+=f"-{uuid.uuid4().hex[:8]}"; backup=history_dir/f"{history_id}.md"
+            self._atomic_markdown_write(backup,current)
+            try:
+                path.unlink()
+                relpath=f"@memory/knowledge/{page_id}.md"
+                db.execute("DELETE FROM chunks WHERE project_id=? AND relpath=?",(project_id,relpath))
+                db.execute("DELETE FROM sources WHERE project_id=? AND relpath=?",(project_id,relpath))
+                db.commit()
+            except Exception:
+                if not path.exists() and backup.is_file(): self._atomic_markdown_write(path,backup.read_text(encoding="utf-8"))
+                db.rollback()
+                raise
+        return {"project_id":project_id,"page_id":page_id,"deleted_from_current":True,"index_invalidated":True,
+                "history_id":history_id,"retained_in_history":True,"erasure_complete":False,
+                "retention_note":"The service history copy remains available; external exports, filesystem backups, and Git copies are outside this operation.",
+                "source_revision":self.source_revision(project_id)}

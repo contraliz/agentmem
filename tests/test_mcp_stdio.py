@@ -30,7 +30,11 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert "Registration creates empty scaffolding, not verified knowledge" in handshake_guidance
             tools=await client.list_tools()
             names={tool.name for tool in tools.tools}
-            assert {"projects","attach_project","knowledge","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","proposals","export_project"}.issubset(names)
+            assert {"projects","attach_project","knowledge","index_project","check_project_changes","retrieve_evidence","tasks","claim_task","task_context","record_work","lessons","requirements","decisions","proposals","export_project","import_project"}.issubset(names)
+            knowledge_schema=next(tool.input_schema for tool in tools.tools if tool.name=="knowledge")
+            task_schema=next(tool.input_schema for tool in tools.tools if tool.name=="tasks")
+            assert "content_offset" in knowledge_schema["properties"]
+            assert {"owner","lease_token","idempotency_key","change_note","source_type","source_ref","source_date"}.issubset(task_schema["properties"])
             assert all(not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",tool.description or "",re.I) for tool in tools.tools)
             projects_description=next(tool.description for tool in tools.tools if tool.name=="projects")
             assert "For a new KB" in projects_description and "scaffolding only" in projects_description
@@ -41,12 +45,23 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert result.structured_content["onboarding"]["state"]=="scaffold_only"
             assert result.structured_content["onboarding"]["newly_registered"] is True
             assert result.structured_content["onboarding"]["curation_status"]=="not_started"
+            rejected=await client.call_tool("projects",{"action":"unknown"})
+            assert rejected.structured_content["ok"] is False
+            assert rejected.structured_content["error"]["code"]=="invalid_request"
+            assert rejected.structured_content["error"]["reason"] and rejected.structured_content["error"]["recovery"]
             page_list=await client.call_tool("knowledge",{"action":"list","project_id":"pilot"})
             assert page_list.structured_content["count"]==5
             page=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"purpose"})
             assert page.structured_content["content"].startswith("# Purpose and scope")
             created_page=await client.call_tool("knowledge",{"action":"create","project_id":"pilot","page_id":"mcp-notes","title":"MCP notes","content":"A unique evidence token confirms immediate indexing."})
             assert created_page.structured_content["fresh"] is True
+            long_tail="Continuation reaches the final paragraph."
+            long_content="# Long page\n\n"+"Policy pagination fixture. "*600+long_tail
+            await client.call_tool("knowledge",{"action":"create","project_id":"pilot","page_id":"long-page","title":"Long page","content":long_content})
+            first_page=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"long-page"})
+            assert first_page.structured_content["content_truncated"] is True
+            continuation=await client.call_tool("knowledge",{"action":"read","project_id":"pilot","page_id":"long-page","content_offset":first_page.structured_content["next_content_offset"]})
+            assert continuation.structured_content["content_complete"] is True and long_tail in continuation.structured_content["content"]
             reused=await client.call_tool("projects",{"action":"register","project_id":"pilot","root":str(project),"description":"stdio test"})
             assert reused.structured_content["onboarding"]["state"]=="existing_registration"
             assert reused.structured_content["onboarding"]["newly_registered"] is False
@@ -72,8 +87,8 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert attached.structured_content["project"]["id"]=="pilot"
             assert len(str(attached.structured_content))<6500
             assert attached.structured_content["indexed_sources"]==[]
-            assert attached.structured_content["indexed_source_count"]==11
-            assert attached.structured_content["knowledge_pages"]["count"]==6
+            assert attached.structured_content["indexed_source_count"]==12
+            assert attached.structured_content["knowledge_pages"]["count"]==7
             assert "No source files have been indexed yet." not in attached.structured_content["unknowns"]
             assert not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",str(attached.structured_content),re.I)
             started=time.perf_counter()
@@ -91,7 +106,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             manifest=await client.call_tool("attach_project",{"project_id":"pilot","include_sources":True})
             assert {item["path"] for item in manifest.structured_content["indexed_sources"]}=={
                 "README.md","@memory/PROJECT.md","@memory/requirements.md","@memory/decisions.md","@memory/approvals.md",
-                *{f"@memory/knowledge/{page_id}.md" for page_id in ("purpose","architecture","risks","history","materials","mcp-notes")},
+                *{f"@memory/knowledge/{page_id}.md" for page_id in ("purpose","architecture","risks","history","materials","mcp-notes","long-page")},
             }
             other=tmp_path/"other"; other.mkdir(); (other/"README.md").write_text("completely unrelated notes",encoding="utf-8")
             await client.call_tool("projects",{"action":"register","project_id":"other","root":str(other)})
@@ -105,18 +120,28 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert edited.structured_content["priority"]==2
             second=await client.call_tool("tasks",{"action":"create","project_id":"pilot","title":"Update docs","goal":"Document verified retry behavior","acceptance":["doc checked"],"depends_on":[first_id]})
             assert second.structured_content["ready"] is False
-            lesson=await client.call_tool("lessons",{"action":"propose","project_id":"pilot","title":"Check retry budget","trigger_text":"When verifying retry limit behavior","procedure":"Compare the current retry count to indexed documentation.","evidence":["README.md#L1-L1"]})
+            lesson=await client.call_tool("lessons",{"action":"propose","project_id":"pilot","title":"Check retry budget","trigger_text":"When verifying retry limit behavior","procedure":"Compare the current retry count to indexed documentation.","evidence":["README.md#L1-L1"],"environment":{"os":"test"},"confirmed_cause":"Retry setting was changed.","hypotheses":["The caller may retry upstream."]})
+            assert lesson.structured_content["environment"]=={"os":"test"}
+            assert lesson.structured_content["hypotheses"]==["The caller may retry upstream."]
             reviewed=await client.call_tool("lessons",{"action":"review","project_id":"pilot","lesson_id":lesson.structured_content["id"],"status":"accepted"})
             assert reviewed.structured_content["status"]=="accepted"
             claim=await client.call_tool("claim_task",{"project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_seconds":120})
             token=claim.structured_content["lease_token"]
+            blank_key=await client.call_tool("tasks",{"action":"revise-acceptance","project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_token":token,"acceptance":["evidence saved"],"idempotency_key":" "})
+            assert blank_key.structured_content["ok"] is False
+            assert blank_key.structured_content["error"]["code"]=="idempotency_error"
+            assert blank_key.structured_content["error"]["reason"] and blank_key.structured_content["error"]["recovery"]
+            acceptance=await client.call_tool("tasks",{"action":"revise-acceptance","project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_token":token,"acceptance":["evidence saved","source checked"],"idempotency_key":"mcp-acceptance-revision","change_note":"Add source verification to the caller-provided acceptance.","source_type":"user_instruction","source_ref":"MCP integration fixture","source_date":"2026-10-19"})
+            assert acceptance.structured_content["acceptance_revision"]==2
+            acceptance_history=await client.call_tool("tasks",{"action":"history","project_id":"pilot","task_id":first_id})
+            assert acceptance_history.structured_content["history"][-1]["criteria"]==["evidence saved","source checked"]
             task_packet=await client.call_tool("task_context",{"project_id":"pilot","task_id":first_id})
             assert task_packet.structured_content["task"]["id"]==first_id
             assert task_packet.structured_content["applicable_accepted_lessons"]
             assert not re.search(r"\b(delegate|delegation|subagent|spawn|worker)\b",str(task_packet.structured_content),re.I)
             cp=await client.call_tool("record_work",{"action":"checkpoint","project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_token":token,"checkpoint":{"last_verified":"retry limit four","next_action":"document it"}})
             assert cp.structured_content["checkpoint"]["last_verified"]=="retry limit four"
-            receipt=await client.call_tool("record_work",{"action":"receipt","project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_token":token,"idempotency_key":"test-1","receipt":{"status":"done","lesson_ids":[lesson.structured_content["id"]],"lesson_feedback":"kept work aligned with project evidence","acceptance_checks":[{"criterion":"evidence saved","met":True,"evidence":"README.md#L1-L1"}]}})
+            receipt=await client.call_tool("record_work",{"action":"receipt","project_id":"pilot","task_id":first_id,"owner":"test-codex","lease_token":token,"idempotency_key":"test-1","receipt":{"status":"done","acceptance_revision":2,"lesson_ids":[lesson.structured_content["id"]],"lesson_feedback":"kept work aligned with project evidence","acceptance_checks":[{"criterion":"evidence saved","met":True,"evidence":"README.md#L1-L1"},{"criterion":"source checked","met":True,"evidence":"MCP source-history assertion"}]}})
             assert receipt.structured_content["status"]=="done"
             assert (await client.call_tool("tasks",{"action":"show","project_id":"pilot","task_id":second.structured_content["id"]})).structured_content["ready"] is True
             exported=await client.call_tool("export_project",{"project_id":"pilot"})
@@ -151,9 +176,9 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             assert gated_context.structured_content["approval"]["status"]=="approved"
             assert (await client.call_tool("claim_task",{"project_id":"pilot","task_id":gated_task.structured_content["id"],"owner":"gated-test"})).structured_content["task"]["status"]=="in_progress"
             exports=await client.call_tool("export_project",{"project_id":"pilot"})
-            assert exports.structured_content["schema_version"]==4 and exports.structured_content["requirements"] and exports.structured_content["decisions"]
+            assert exports.structured_content["schema_version"]==6 and exports.structured_content["requirements"] and exports.structured_content["decisions"]
             assert len(exports.structured_content["proposals"])==1 and len(exports.structured_content["approval_events"])==1
-            assert exports.structured_content["knowledge_manifest"]["page_count"]==6
+            assert exports.structured_content["knowledge_manifest"]["page_count"]==7
             assert attach_ms<2000 and search_ms<2000
             print(f"stdio probe attach_ms={attach_ms:.1f} search_ms={search_ms:.1f} combined_attach_query_ms={combined_ms:.1f}")
 

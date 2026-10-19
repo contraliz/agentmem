@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from functools import wraps
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from .store import MemoryStore
+from .store import AgentMemError, MemoryStore
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("agentmem")
@@ -29,7 +31,36 @@ def _out(value: Any) -> dict[str, Any]:
     return value
 
 
-@mcp.tool()
+def _tool():
+    def register(function):
+        @wraps(function)
+        def invoke(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except AgentMemError as exc:
+                return {"ok":False,"error":exc.as_dict()}
+            except ValueError as exc:
+                reason=re.sub(r"(?:[A-Za-z]:\\|/)[^\s'\";]+","[local path]",str(exc))
+                lowered=reason.casefold()
+                code=("stale_revision" if "revision conflict" in lowered else
+                      "not_found" if "not found" in lowered or "missing" in lowered else
+                      "scope_violation" if any(x in lowered for x in ("project", "scope", "escape", "symlink", "authorized_paths")) else
+                      "idempotency_error" if "idempotency_key" in lowered else "invalid_request")
+                recovery=("Read the current record and retry with its current revision." if code=="stale_revision" else
+                          "Verify the project ID and record ID, then read the record before retrying." if code=="not_found" else
+                          "Confirm the selected project and keep the operation within its registered scope." if code=="scope_violation" else
+                          "Use a non-empty idempotency key and reuse it only for an identical request." if code=="idempotency_error" else
+                          "Check the operation's required inputs and current state before retrying.")
+                return {"ok":False,"error":{"code":code,"reason":reason,"recovery":recovery}}
+            except Exception:
+                log.exception("Unexpected AgentMem tool failure in %s",function.__name__)
+                return {"ok":False,"error":{"code":"internal_error","reason":"The operation failed unexpectedly.",
+                    "recovery":"Read the target record to establish whether any prior write committed; then retry or contact the local operator."}}
+        return mcp.tool()(invoke)
+    return register
+
+
+@_tool()
 def projects(action: str = "list", project_id: str = "", root: str = "", description: str = "", cwd: str = "", memory_root: str = "") -> dict[str, Any]:
     """List or resolve projects, or register a new project. For a new KB, confirm its exact ID and source root; registration creates empty scaffolding only, so next index safe files, attach and inspect cited evidence, then curate focused pages and report gaps. Existing ID/root or KB conflicts fail rather than silently rebind or adopt content."""
     if action == "list": return _out({"projects": store.list_projects()})
@@ -38,73 +69,80 @@ def projects(action: str = "list", project_id: str = "", root: str = "", descrip
     raise ValueError("action must be list, register, or resolve")
 
 
-@mcp.tool()
+@_tool()
 def attach_project(project_id: str, max_chars: int = 6500, query: str = "", include_sources: bool = False) -> dict[str, Any]:
     """Return bounded project context; add query for focused citations or include_sources for a detailed source manifest."""
     return _out(store.attach(project_id, max_chars, query, include_sources))
 
 
-@mcp.tool()
+@_tool()
 def knowledge(action: str, project_id: str, page_id: str = "", title: str = "", content: str = "",
               expected_sha256: str = "", history_id: str = "", limit: int = 50, offset: int = 0,
-              max_chars: int = 12000) -> dict[str, Any]:
+              max_chars: int = 12000, content_offset: int = 0) -> dict[str, Any]:
     """Initialize, list, read, create, update, or inspect history for safe project knowledge pages under this project's KB."""
     if action == "init": return _out(store.initialize_knowledge(project_id))
     if action == "list": return _out(store.list_knowledge_pages(project_id,limit,offset))
-    if action == "read": return _out(store.read_knowledge_page(project_id,page_id,max_chars,history_id))
+    if action == "read": return _out(store.read_knowledge_page(project_id,page_id,max_chars,history_id,content_offset))
     if action == "create": return _out(store.create_knowledge_page(project_id,page_id,title,content))
     if action == "update": return _out(store.update_knowledge_page(project_id,page_id,content,expected_sha256))
+    if action == "delete": return _out(store.delete_knowledge_page(project_id,page_id,expected_sha256))
     if action == "history": return _out(store.knowledge_page_history(project_id,page_id,limit))
     raise ValueError("action must be init, list, read, create, update, or history")
 
 
-@mcp.tool()
+@_tool()
 def index_project(project_id: str, max_files: int = 5000) -> dict[str, Any]:
     """Incrementally index safe text files under the source root and project knowledge directory, with path/hash/line provenance."""
     return _out(store.index_project(project_id, max_files))
 
 
-@mcp.tool()
+@_tool()
 def check_project_changes(project_id: str, max_files: int = 5000) -> dict[str, Any]:
     """Quickly compare source-root and project-knowledge paths, timestamps, and sizes without reading file contents."""
     return _out(store.check_project_changes(project_id,max_files))
 
 
-@mcp.tool()
+@_tool()
 def retrieve_evidence(project_id: str, query: str, limit: int = 5) -> dict[str, Any]:
     """Search indexed project evidence. Returns cited excerpts and gaps; it does not call an answer model."""
     return _out(store.search(project_id, query, limit))
 
 
-@mcp.tool()
+@_tool()
 def tasks(action: str, project_id: str, task_id: str = "", title: str = "", goal: str = "",
           acceptance: list[str] | None = None, priority: int | None = None, depends_on: list[str] | None = None,
           authorized_paths: list[str] | None = None, status: str = "all", blocked_reason: str | None = None,
           checkpoint: dict[str, Any] | None = None, components: list[str] | None = None,
-          requirement_ids: list[str] | None = None, approval_proposal_id: str = "") -> dict[str, Any]:
+          requirement_ids: list[str] | None = None, approval_proposal_id: str = "", owner: str = "",
+          lease_token: str = "", idempotency_key: str = "", change_note: str = "",
+          source_type: str = "", source_ref: str = "", source_date: str = "") -> dict[str, Any]:
     """Create/list/show or edit unclaimed open tasks. Ready work is derived from dependencies; use record_work for checkpoints and receipts."""
     if action == "create":
         return _out(store.create_task(project_id,title,goal,acceptance,priority or 3,depends_on,authorized_paths,blocked_reason or "",components,requirement_ids,approval_proposal_id))
     if action == "update":
         return _out(store.update_task(project_id,task_id,title or None,goal or None,acceptance,priority,authorized_paths,depends_on,blocked_reason,components,requirement_ids,approval_proposal_id if approval_proposal_id else None))
+    if action == "revise-acceptance":
+        return _out(store.revise_task_acceptance(project_id,task_id,owner,lease_token,acceptance or [],idempotency_key,change_note,source_type,source_ref,source_date))
+    if action == "history": return _out(store.task_acceptance_history(project_id,task_id))
     if action == "list": return _out({"tasks":store.list_tasks(project_id,status)})
     if action == "show": return _out(store.get_task(project_id,task_id))
-    raise ValueError("action must be create, list, or show")
+    raise ValueError("action must be create, list, show, update, revise-acceptance, or history")
 
 
-@mcp.tool()
+@_tool()
 def claim_task(project_id: str, task_id: str, owner: str, lease_seconds: int = 1800) -> dict[str, Any]:
     """Atomically claim ready work and return its ownership token; another session cannot claim the active lease."""
     return _out(store.claim_task(project_id,task_id,owner,lease_seconds))
 
 
-@mcp.tool()
-def task_context(project_id: str, task_id: str, max_chars: int = 12000, requirement_offset: int = 0, requirements_limit: int = 12) -> dict[str, Any]:
+@_tool()
+def task_context(project_id: str, task_id: str, max_chars: int = 12000, requirement_offset: int = 0,
+                 requirements_limit: int = 12, acceptance_offset: int = 0, acceptance_limit: int = 20) -> dict[str, Any]:
     """Assemble task scope, mandatory applicable requirements, checkpoint, accepted lessons, cited evidence, and freshness notes."""
-    return _out(store.task_context(project_id,task_id,max_chars,requirement_offset,requirements_limit))
+    return _out(store.task_context(project_id,task_id,max_chars,requirement_offset,requirements_limit,acceptance_offset,acceptance_limit))
 
 
-@mcp.tool()
+@_tool()
 def record_work(action: str, project_id: str, task_id: str, owner: str, lease_token: str,
                 checkpoint: dict[str, Any] | None = None, receipt: dict[str, Any] | None = None,
                 idempotency_key: str = "", lease_seconds: int = 1800, blocked_reason: str = "") -> dict[str, Any]:
@@ -121,19 +159,22 @@ def record_work(action: str, project_id: str, task_id: str, owner: str, lease_to
     raise ValueError("action must be checkpoint, renew, release, or receipt")
 
 
-@mcp.tool()
+@_tool()
 def lessons(action: str, project_id: str, query: str = "", lesson_id: str = "", title: str = "",
             trigger_text: str = "", procedure: str = "", evidence: list[str] | None = None,
-            outcome: str = "", status: str = "", supersedes: str = "", source_task_id: str = "") -> dict[str, Any]:
+            outcome: str = "", status: str = "", supersedes: str = "", source_task_id: str = "",
+            environment: dict[str, Any] | None = None, confirmed_cause: str = "",
+            preconditions: list[str] | None = None, exclusions: list[dict[str, Any]] | None = None,
+            hypotheses: list[str] | None = None) -> dict[str, Any]:
     """Retrieve accepted lessons, propose a candidate, or review a candidate as accepted/rejected/superseded."""
-    if action == "retrieve": return _out({"lessons":store.search_lessons(project_id,query)})
-    if action == "propose": return _out(store.propose_lesson(project_id,title,trigger_text,procedure,evidence,outcome,source_task_id))
+    if action == "retrieve": return _out({"lessons":store.search_lessons(project_id,query,environment=environment)})
+    if action == "propose": return _out(store.propose_lesson(project_id,title,trigger_text,procedure,evidence,outcome,source_task_id,environment,confirmed_cause,preconditions,exclusions,hypotheses))
     if action == "review": return _out(store.review_lesson(project_id,lesson_id,status,supersedes))
     if action == "show": return _out(store.get_lesson(project_id,lesson_id))
     raise ValueError("action must be retrieve, propose, review, or show")
 
 
-@mcp.tool()
+@_tool()
 def requirements(action: str, project_id: str, requirement_id: str = "", title: str = "", statement: str = "",
                  kind: str = "", lifecycle: str = "", fulfillment: str = "",
                  original_quote: str = "", interpretation: str = "", scope: dict[str, Any] | None = None,
@@ -171,7 +212,7 @@ def requirements(action: str, project_id: str, requirement_id: str = "", title: 
     raise ValueError("action must be create, list, show, history, update, fulfill, supersede, withdraw, or sync")
 
 
-@mcp.tool()
+@_tool()
 def decisions(action: str, project_id: str, decision_id: str = "", title: str = "", choice: str = "",
               rationale: str = "", alternatives: list[str] | None = None, scope: dict[str, Any] | None = None,
               status: str = "", source_type: str = "", source_ref: str = "", source_date: str = "",
@@ -201,7 +242,7 @@ def decisions(action: str, project_id: str, decision_id: str = "", title: str = 
     raise ValueError("action must be create, list, show, history, or sync")
 
 
-@mcp.tool()
+@_tool()
 def proposals(action: str, project_id: str, proposal_id: str = "", title: str = "", content: str = "",
               targets: list[dict[str, Any]] | None = None, approval_required: bool | None = None,
               expected_revision: int | None = None, original_quote: str = "", source_type: str = "",
@@ -236,16 +277,22 @@ def proposals(action: str, project_id: str, proposal_id: str = "", title: str = 
     raise ValueError("action must be create, list, show, status, update, approve, reject, withdraw, history, approval-history, or sync")
 
 
-@mcp.tool()
+@_tool()
 def update_project_brief(project_id: str, markdown: str) -> dict[str, Any]:
     """Write curated project context only to the service-owned PROJECT.md file under that project's knowledge directory."""
     return _out(store.update_project_brief(project_id,markdown))
 
 
-@mcp.tool()
+@_tool()
 def export_project(project_id: str) -> dict[str, Any]:
     """Export project work, knowledge-record histories, approval snapshots, and page manifest as portable JSON data."""
     return _out(store.export_project(project_id))
+
+
+@_tool()
+def import_project(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Restore an export's structured records into an empty, same-project ledger; Markdown files and search indexes are restored separately."""
+    return _out(store.import_project(project_id,payload))
 
 
 if __name__ == "__main__":

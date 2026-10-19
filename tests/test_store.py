@@ -216,8 +216,8 @@ def test_shared_legacy_store_migrates_all_records_into_isolated_project_director
     db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,status,acceptance,authorized_paths,owner,lease_token,lease_until,source_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("a2","alpha","Second","Remain queued",2,"open","[]","[]","","",0,"old-revision",now,now))
     db.execute("INSERT INTO dependencies(task_id,depends_on) VALUES(?,?)",("a2","a1"))
     receipt_body=json.dumps({"status":"done","acceptance_checks":[{"criterion":"verified","met":True,"evidence":"test evidence"}]})
-    db.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?,?)",("r1","a1","alpha","tester",receipt_body,now,"idem"))
-    db.execute("INSERT INTO lessons VALUES(?,?,?,?,?,?,?,?,?,?)",("l1","alpha","Use evidence","before answering","cite the verified project brief","[\"@memory/PROJECT.md#L1-L2\"]","preserved","accepted","",now))
+    db.execute("INSERT INTO receipts(id,task_id,project_id,owner,body,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?)",("r1","a1","alpha","tester",receipt_body,now,"idem"))
+    db.execute("INSERT INTO lessons(id,project_id,title,trigger_text,procedure,evidence,outcome,status,supersedes,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",("l1","alpha","Use evidence","before answering","cite the verified project brief","[\"@memory/PROJECT.md#L1-L2\"]","preserved","accepted","",now))
     db.execute("INSERT INTO lesson_uses VALUES(?,?,?,?)",("l1","r1","helped",now))
     db.execute("INSERT INTO tasks(id,project_id,title,goal,priority,status,acceptance,authorized_paths,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",("b1","beta","Isolated","Keep separate",3,"open","[]","[]",now,now))
     db.commit(); db.close()
@@ -252,9 +252,9 @@ def test_shared_legacy_store_migrates_all_records_into_isolated_project_director
         with pytest.raises(sqlite3.IntegrityError,match="migrated"):
             frozen.execute("UPDATE tasks SET title='wrong' WHERE id='a1'")
         with pytest.raises(sqlite3.IntegrityError,match="migrated"):
-            frozen.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?,?)",("r-old","a1","alpha","tester","{}",now,"old"))
+            frozen.execute("INSERT INTO receipts(id,task_id,project_id,owner,body,created_at,idempotency_key) VALUES(?,?,?,?,?,?,?)",("r-old","a1","alpha","tester","{}",now,"old"))
         with pytest.raises(sqlite3.IntegrityError,match="migrated"):
-            frozen.execute("INSERT INTO lessons VALUES(?,?,?,?,?,?,?,?,?,?)",("l-old","alpha","old","trigger","procedure","[]","","candidate","",now))
+            frozen.execute("INSERT INTO lessons(id,project_id,title,trigger_text,procedure,evidence,outcome,status,supersedes,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",("l-old","alpha","old","trigger","procedure","[]","","candidate","",now))
         # FTS5 virtual tables cannot have SQLite triggers. An old index operation
         # must fail on its guarded source-table write and roll back the FTS change
         # in the same transaction.
@@ -415,8 +415,10 @@ def test_expired_lease_reclaim_and_receipt_completion_evidence(setup):
     assert bad["status"]=="in_progress" and not bad["completion_accepted"]
     good=store.record_receipt("p",task["id"],"two",c2["lease_token"],{"status":"done","acceptance_checks":[{"criterion":"accept","met":True,"evidence":"test log"}]},"k2")
     assert good["status"]=="done"
-    duplicate=store.record_receipt("p",task["id"],"two","bad",{},"k2")
+    duplicate=store.record_receipt("p",task["id"],"two","bad",{"status":"done","acceptance_checks":[{"criterion":"accept","met":True,"evidence":"test log"}]},"k2")
     assert duplicate["duplicate"] is True
+    with pytest.raises(ValueError,match="different receipt content"):
+        store.record_receipt("p",task["id"],"two","bad",{},"k2")
 
 
 def test_lessons_need_review_and_are_project_scoped(setup, tmp_path):
@@ -456,9 +458,9 @@ def test_restart_persistence_and_export(setup):
     restored=MemoryStore(data)
     assert restored.get_task("p",task["id"])["title"]=="persist"
     exported=restored.export_project("p")
-    assert exported["schema_version"]==4 and exported["tasks"]
+    assert exported["schema_version"]==6 and exported["tasks"]
     assert exported["knowledge_manifest"]["page_count"]==5
-    with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==7
+    with restored.connect("p") as db: assert db.execute("PRAGMA user_version").fetchone()[0]==10
 
 
 def test_task_context_is_bounded_and_reports_indexed_revision_change(setup):

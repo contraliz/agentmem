@@ -178,7 +178,7 @@ def test_schema_v3_upgrade_adds_requirement_tables_and_completion_guard_without_
         db.execute("PRAGMA user_version=3")
     assert setup.get_task("p",task["id"])["title"]=="existing work"
     with setup.connect("p") as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0]==7
+        assert db.execute("PRAGMA user_version").fetchone()[0]==10
         assert {r["name"] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} >= {"requirements","decisions","requirement_history","decision_history"}
         assert db.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='guard_task_done_requires_current_requirement_revision'").fetchone()
     assert setup.get_task("p",task["id"])["title"]=="existing work"

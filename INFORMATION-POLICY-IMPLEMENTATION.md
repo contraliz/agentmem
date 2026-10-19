@@ -1,0 +1,45 @@
+# Information policy implementation crosswalk
+
+This file records the current implementation of the non-hook portions of the
+AgentMem information policy. The complete policy in the AgentMem knowledge base
+remains authoritative. This crosswalk reports behavior and verification; it
+does not create a second editable record ledger.
+
+## Current coverage
+
+| Policy area | Implemented behavior | Evidence and limits |
+|---|---|---|
+| Canonical record types and provenance | Focused narrative Markdown pages are separate from SQLite tasks, revisioned requirements and decisions, versioned proposals and approvals, receipts, acceptance history, and reviewed lessons. Requirement/decision/approval Markdown files are generated projections. Source hashes and relative paths identify indexed evidence; record APIs retain source wording, source references, status, scope, revisions, uncertainty, and explicit history where supported. | src/agentmem/store.py; tests/test_requirements.py, tests/test_approvals.py, tests/test_information_policy.py. Search chunks and projections are rebuildable. A JSON export includes a page manifest but not Markdown or source contents. Import only accepts an empty destination with the same project ID and registered source-root binding; task leases are cleared. |
+| Corrections, deduplication, and deletion | Requirements, decisions, proposals, approval events, pages, and task acceptance revisions use history/version checks. Revisioned record writes require nonblank idempotency keys with exact request-hash retry behavior. Knowledge-page updates/deletes use SHA-256 compare-and-swap and preserve a history copy. Page deletion invalidates its current index entry and explicitly reports that erasure is incomplete. | Supported deletion is scoped to a current Markdown page. External exports, filesystem backups, Git copies, and retained page history are outside that operation. Structured ledgers retain audit history; no blanket erasure promise is made. |
+| Progressive retrieval and budgets | Attach returns a compact brief and described page inventory. Pages have direct ID reads with character-offset continuation and line references; lexical FTS returns focused excerpts, stable source hashes, citations, freshness state, and source revision. Task context returns mandatory applicable requirements before relevance-ranked evidence, approval status by reference, bounded lesson/evidence candidates, and requirement/acceptance continuation. Serialized output is measured and omissions are explicit. | tests/test_knowledge.py, tests/test_requirements.py, tests/test_information_policy.py, tests/test_mcp_stdio.py. The server supplies retrieval data and limits, but cannot force a host to retain context or guarantee a model calls tools. Full approval wording is fetched from approval history. |
+| Lesson applicability | Candidate discovery is separate from reviewed status and applicability. Lessons can carry environment/version/platform fields, confirmed cause, separate hypotheses, preconditions, exclusions, source task, outcome, and evidence. Retrieval reports deterministic applicable, not_applicable, or insufficient_information outcomes with reasons and missing fields. | Legacy lessons without structured conditions remain insufficient_information; lexical overlap alone never proves applicability. The calling agent still judges the returned narrative and evidence. No second LLM is invoked. |
+| Freshness and evidence excerpts | The metadata scan is labelled metadata_scan_only. Citation search reads and hashes the current safe source before calling it content_checked; changed, missing, unreadable, or unsafe sources receive explicit states. Reindexing hashes full contents, so same-size/preserved-mtime edits are detected when content is checked. Excerpts center around lexical/CJK hit terms and retain valid line ranges. Secret-named files and files with credential-shaped assignments are skipped and removed from the current index on reindex. | Content freshness is checked at search time; it does not reindex the source or prove a fact remains true. Direct Markdown edits require index_project. tests/test_information_policy.py covers same-size/preserved-mtime edits, removal, deep hits, CJK hits, and secret-shaped content. |
+| Setup and portability | Setup discovers the Python launcher or interpreter, validates Python 3.11+ to match pyproject.toml, accepts an explicit interpreter path, and gives actionable failures. AGENTMEM_MEMORY_ROOT and --memory-root remain supported. Schema migrations back up before additive upgrades and serialize concurrent startup migration through the shared registry. | Windows PowerShell parsing and Python 3.13 execution were checked. No Linux/macOS setup run was available in this pass. Migration/round-trip tests use temporary project databases; no other registered KB was migrated. |
+| Search-quality evaluation | Reproducible fixtures cover exact and overlapping-paraphrase lexical retrieval, cross-topic and project-isolated content, Chinese bigram fallback, wrong/unknown lesson environments, changed and removed sources, deep hits, large approval quotes, requirement continuation, and serialized budgets. | The observed implementation remains lexical FTS5 with a CJK bigram fallback. No vector, embedding, cloud, or semantic service was added: the fixtures provide no evidence that an optional recall layer is necessary enough to justify its new dependency. Exact ranking/recall is not guaranteed, and no performance target is claimed. |
+
+## Teacher-reported defects
+
+| Defect | Current behavior | Regression evidence |
+|---|---|---|
+| 1. Partial or unrelated task checks | Exact saved criteria are counted; missing, duplicate/excess, unknown, false, or unevidenced checks cannot complete work. Acceptance revisions are provenance-tracked, and a changed revision must be named by the receipt. | test_receipt_requires_exact_saved_criteria_and_idempotent_payload; test_in_progress_acceptance_revision_is_source_attributed_and_required_by_receipt |
+| 2. Requirement supersession self/cycles and missing targets | Writes reject self-links, missing/cross-project targets, and cycles; inherited graph reads detect and report corrupt legacy cycles. | test_requirement_supersession_rejects_self_cycle_and_missing_target and requirement history/task-link tests |
+| 3. Projection failure after database commit | The API reports record_committed, ID/revision, failed projection status, and safe retry guidance. It preserves manual edits and supports explicit backed-up regeneration. | test_projection_failure_reports_committed_record_and_retry_preserves_manual_text |
+| 4. Empty fulfillment update bypass | The merged resulting fulfillment state is validated; an explicit empty evidence list cannot rely on prior evidence. | test_empty_fulfillment_evidence_cannot_bypass_merged_state |
+| 5. Freshness semantics | Search reports current-content hash state separately from index consistency and metadata-only scans. | test_content_freshness_detects_preserved_metadata_and_deep_hit_excerpt |
+| 6. Hit clipped from excerpt | Search and combined attach-query excerpts center on the actual matched term, including CJK bigram fallback. | test_content_freshness_detects_preserved_metadata_and_deep_hit_excerpt; test_chinese_fallback_excerpt_centers_on_actual_bigram |
+| 7. Large approval quote exceeds packet budget | Task context carries a compact quote hash/length and approval-history continuation; further compacting keeps the whole serialized packet within its character limit and marks omissions. | test_approval_context_is_compact_and_task_packet_stays_bounded |
+| 8. Blank or mismatched idempotency keys | Public record writes reject blank/non-string keys and bind retries to request hashes. | test_receipt_requires_exact_saved_criteria_and_idempotent_payload and record API tests |
+| 9. Generic MCP domain errors | Expected validation failures return stable error code, reason, and recovery fields; unexpected failures are logged and return a generic internal error without local exception details. | Negative MCP protocol path in test_stdio_server_lists_and_calls_tools |
+
+## Explicit exclusions and boundaries
+
+Hook scripts/registrations/trust, hook packaging, Stop/SessionStart/compaction
+integrations, wrappers, scheduled triggers, background services, automatic
+model calls, lifecycle interception, normal-trust/desktop smoke tests, and
+end-of-pass prompts are not implemented here. The policy remains marked draft
+while those separate runtime questions are unresolved.
+
+Semantic search, vector aliases, embeddings, and external services remain
+optional and are not included. AgentMem stores and retrieves project data; it
+does not guarantee complete capture of messages, truth of a fact, persistent
+host context, semantic recall, or caller compliance.
