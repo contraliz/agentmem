@@ -92,6 +92,8 @@ def test_project_local_install_is_idempotent_and_uninstall_preserves_other_hooks
 
     installed = install("pilot", str(root), str(data), python_exe=r"C:\Python 3.13\python.exe")
     assert installed["handlers"] == 1
+    assert "documented review flow is /hooks in the Codex CLI" in installed["trust"]
+    assert "Desktop trust review is unverified" in installed["trust"]
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert config["description"] == original["description"]
     assert config["otherMetadata"] == original["otherMetadata"]

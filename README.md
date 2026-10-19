@@ -43,7 +43,9 @@ AgentMem can install an opt-in Codex `Stop` hook for one registered project. Fro
 & .\agentmem.ps1 hooks status --project-id agentmem --root (Get-Location).Path
 ```
 
-The installer verifies the exact registered source root and merges one marked handler into that project's `.codex/hooks.json`. It does not change user-wide Codex settings or trust. The generated local config is ignored by Git because it contains machine-specific interpreter and registry paths. Codex requires review and trust of the exact project-local hook before running it; use the host's hook review controls (the CLI provides `/hooks`). Project-local hooks also require the project config layer to be trusted.
+The installer verifies the exact registered source root and merges one marked handler into that project's `.codex/hooks.json`. It does not change user-wide Codex settings or trust. The generated local config is ignored by Git because it contains machine-specific interpreter and registry paths. Codex requires review and trust of the exact project-local hook before running it. The documented review flow is `/hooks` in the Codex CLI; App Server `hooks/list` only discovers hooks ([Hooks](https://learn.chatgpt.com/docs/hooks), [App Server](https://learn.chatgpt.com/docs/app-server)). A Desktop-native trust/review control has not been verified. Project-local hooks also require the project config layer to be trusted.
+
+For Desktop use, the currently documented path is to review the exact project hook with `/hooks` in the Codex CLI first, then start a fresh local Desktop turn in the same project. This does not prove that Desktop shares the CLI's hook-trust state or has reloaded the config. Confirm an actual callback before relying on automatic prompting; installation or discovery alone is not activation evidence. Do not use the CLI trust-bypass flag.
 
 At a normal Codex Stop boundary, the hook asks the same Codex session for one short continuation to review only that just-finished pass. The prompt directs the agent to save useful information through the existing AgentMem APIs, preserving provenance and distinctions, or report `no_changes`. Codex sets `stop_hook_active` on that continuation, so the hook lets it finish without asking for another review. A session/turn key suppresses duplicate callbacks while allowing later turns. The hook itself never calls a model or writes knowledge; it can only request a continuation, and it cannot prove that the agent completed the review or that capture is complete. The original turn continues if the hook errors, the project is unregistered/mismatched, or the hook is not trusted; a visible warning is returned when the callback can report one.
 
@@ -53,7 +55,7 @@ To remove only the AgentMem handler while preserving other hooks in the project 
 & .\agentmem.ps1 hooks uninstall --project-id agentmem --root (Get-Location).Path
 ```
 
-The reusable protocol and configuration behavior are covered by local tests. A live normal-trust CLI or Desktop continuation has not been verified here; Desktop behavior is not inferred from the hook schema or CLI configuration. Review and trust the local hook before relying on it.
+The reusable protocol and configuration behavior are covered by local tests. A live normal-trust CLI or Desktop continuation has not been verified here. Desktop configuration discovery, host trust, session loading, and actual callback execution are separate states; installation alone proves none of the latter three. Review and trust the local hook before relying on it.
 
 `AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it defaults to `D:\projects` on Windows. `--data-dir` and `--memory-root` are also available in the CLI. To inspect the registered command, run `codex mcp get agentmem`.
 

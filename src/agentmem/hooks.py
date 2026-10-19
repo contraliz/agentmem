@@ -142,7 +142,7 @@ def install(project_id: str, root: str, data_dir: str, python_exe: str | None = 
     _atomic_json(config_path, config, expected)
     return {"status": "installed", "project_id": project_id, "root": str(root_path), "config": str(config_path),
             "handlers": sum(1 for group in normalized_event for handler in group.get("hooks", []) if _is_ours(handler)),
-            "trust": "pending Codex review; use /hooks in the Codex CLI or review the project-local hook in the host UI"}
+            "trust": "pending Codex review; the documented review flow is /hooks in the Codex CLI; Desktop trust review is unverified"}
 
 
 def status(project_id: str, root: str, data_dir: str) -> dict[str, Any]:
