@@ -34,6 +34,27 @@ When an agent starts a new KB through the MCP, it should first confirm the exact
 
 If the project owner wants persistent project-specific Codex guidance, review [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) and merge suitable instructions into that project's existing `AGENTS.md`; do not overwrite existing instructions. `update_project_brief` writes only to the AgentMem-owned `PROJECT.md` inside that project's registered knowledge directory; original source repositories are read for evidence and are never used as the KB storage location.
 
+## Optional project-local end-of-pass review hook
+
+AgentMem can install an opt-in Codex `Stop` hook for one registered project. From the AgentMem checkout, run:
+
+```powershell
+& .\agentmem.ps1 hooks install --project-id agentmem --root (Get-Location).Path
+& .\agentmem.ps1 hooks status --project-id agentmem --root (Get-Location).Path
+```
+
+The installer verifies the exact registered source root and merges one marked handler into that project's `.codex/hooks.json`. It does not change user-wide Codex settings or trust. The generated local config is ignored by Git because it contains machine-specific interpreter and registry paths. Codex requires review and trust of the exact project-local hook before running it; use the host's hook review controls (the CLI provides `/hooks`). Project-local hooks also require the project config layer to be trusted.
+
+At a normal Codex Stop boundary, the hook asks the same Codex session for one short continuation to review only that just-finished pass. The prompt directs the agent to save useful information through the existing AgentMem APIs, preserving provenance and distinctions, or report `no_changes`. Codex sets `stop_hook_active` on that continuation, so the hook lets it finish without asking for another review. A session/turn key suppresses duplicate callbacks while allowing later turns. The hook itself never calls a model or writes knowledge; it can only request a continuation, and it cannot prove that the agent completed the review or that capture is complete. The original turn continues if the hook errors, the project is unregistered/mismatched, or the hook is not trusted; a visible warning is returned when the callback can report one.
+
+To remove only the AgentMem handler while preserving other hooks in the project file:
+
+```powershell
+& .\agentmem.ps1 hooks uninstall --project-id agentmem --root (Get-Location).Path
+```
+
+The reusable protocol and configuration behavior are covered by local tests. A live normal-trust CLI or Desktop continuation has not been verified here; Desktop behavior is not inferred from the hook schema or CLI configuration. Review and trust the local hook before relying on it.
+
 `AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it defaults to `D:\projects` on Windows. `--data-dir` and `--memory-root` are also available in the CLI. To inspect the registered command, run `codex mcp get agentmem`.
 
 ## Storage layout and migration

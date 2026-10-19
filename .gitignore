@@ -9,6 +9,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .agentmem-data/
+# Local Codex hook commands may contain machine-specific interpreter and data paths.
+.codex/hooks.json
 *.sqlite3-wal
 *.sqlite3-shm
 *.sqlite3-journal
