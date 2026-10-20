@@ -1,57 +1,69 @@
-# Agent Memory local MCP
+# AgentMem
 
-Agent Memory is a local, project-scoped context and work-tracking module for Codex. It is intentionally a reusable building block for a larger project-work system: Python domain/storage APIs sit below MCP and CLI adapters, project facts remain inspectable Markdown, and SQLite stores task coordination, receipts, and a rebuildable evidence index. The service does not call an LLM, execute shell commands, launch workers, or run background jobs. Codex uses retrieved evidence to answer questions and do project work.
+AgentMem is a local, project-scoped context and work-tracking module for Codex. Its Python domain and storage layer sit below MCP and CLI adapters. It keeps authored project facts in inspectable Markdown and structured work records in SQLite. It does not call an LLM, execute shell commands, launch workers, or schedule background jobs.
 
-## Ready to use here
+## Install a wheel
 
-Install AgentMem in a local Python environment and register it in Codex as the stdio MCP server `agentmem`. Its locator registry and migration backups stay in the ignored `.agentmem-data` directory; each project's active SQLite store and Markdown knowledge pages live in its own knowledge directory.
+Use Python 3.11 or newer. After downloading a wheel from the project release page, install it in the Python environment that will run the MCP server:
 
-Each registered project keeps its source repository in its original location and stores its AgentMem knowledge separately. Migration preserves registered project records without copying source repositories or vault content. Data is local; no API key is needed.
-
-## First setup on this PC or another checkout
-
-From PowerShell:
-
-```powershell
-Set-Location <path-to-agentmem-checkout>
-.\scripts\setup.ps1
-.\scripts\install-codex.ps1
+```console
+python -m pip install ./agentmem_local-0.1.0-py3-none-any.whl
+agentmem --help
 ```
 
-Restart/open a Codex session, then check `codex mcp list`. The install script registers a `python.exe -m agentmem.server` stdio command with an explicit data directory. The virtual environment and generated database are ignored by Git.
+To install from a source archive, unpack it and run:
 
-To register another project, use this workspace's stable CLI wrapper from any directory:
-
-```powershell
-& '<path-to-agentmem-checkout>\agentmem.ps1' project register --id sunflower --root '<path-to-sunflower-checkout>' --description 'Sunflower project'
-& '<path-to-agentmem-checkout>\agentmem.ps1' index sunflower
-& '<path-to-agentmem-checkout>\agentmem.ps1' attach sunflower
+```console
+python -m pip install ./agentmem_local-0.1.0.tar.gz
 ```
 
-The default KB will be `D:\projects\sunflower`; pass `--memory-root '<local-path>'` after `register` for a custom location. A project ID cannot be silently rebound to another source root or memory directory.
+For development from a repository checkout, run `python -m pip install .` at its root. The optional PowerShell setup script creates a local virtual environment for development.
+
+AgentMem stores data locally. No API key is needed. Set `AGENTMEM_DATA_DIR` to choose the locator registry and migration-backup folder, and `AGENTMEM_MEMORY_ROOT` to choose where new project knowledge directories are created. By default the registry is under the current user's home directory, and the memory root follows the platform default. Existing projects keep their registered locations; changing the default does not move or migrate their data.
+
+## Register AgentMem in Codex
+
+In PowerShell, register the installed module as a stdio MCP server:
+
+```powershell
+codex mcp add agentmem `
+  --env "AGENTMEM_DATA_DIR=$env:LOCALAPPDATA\AgentMem\data" `
+  --env "AGENTMEM_MEMORY_ROOT=$env:USERPROFILE\AgentMem\projects" `
+  -- python -m agentmem.server
+codex mcp list
+```
+
+Use the Python interpreter where the wheel was installed if `python` resolves to a different environment. Restart or open a Codex session to load the server and current tool definitions.
+
+After installation, the `agentmem` command works from any current directory:
+
+```console
+agentmem project register --id example-project --root <path-to-project> --description "Example project"
+agentmem index example-project
+agentmem attach example-project
+```
+
+Pass `--memory-root <path>` to `project register` to choose that project's knowledge directory. A project ID cannot be silently rebound to another source root or memory directory. See [DISTRIBUTION.md](DISTRIBUTION.md) for local artifact builds and current release readiness.
 
 When an agent starts a new KB through the MCP, it should first confirm the exact project ID and source root (or resolve a registered working directory), then call `projects(action="register")`. The registration result includes an `onboarding` object: a new project is `scaffold_only`, with `curation_status="not_started"` and next steps; a repeated registration is reported as `existing_registration` and asks the agent to inspect current context before doing setup again. Registration creates the database, manifest, linked brief, empty topic pages, and generated record views. It does not index source files or establish project facts. Follow the returned steps: call `index_project`, inspect `attach_project` and cited evidence, curate `PROJECT.md` and focused pages, then report what is verified and what remains unknown. Existing project identity or knowledge-directory conflicts fail; no KB is adopted or overwritten.
 
 If the project owner wants persistent project-specific Codex guidance, review [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) and merge suitable instructions into that project's existing `AGENTS.md`; do not overwrite existing instructions. `update_project_brief` writes only to the AgentMem-owned `PROJECT.md` inside that project's registered knowledge directory; original source repositories are read for evidence and are never used as the KB storage location.
 
-## Wrapper-injected prompts
+## Project recording reminder
 
-AgentMem provides small prompt payloads for a caller-controlled wrapper. The CLI validates the registered project ID and prints JSON containing the prompt:
+`attach_project` returns a concise `recording_reminder` and `end_of_pass_summary_reminder`. The agent should briefly name knowledge pages or entries it saved or changed at the end of its work pass, or state that there were no project knowledge changes. Repository indexing is code indexing, not knowledge ingestion. These are agent-facing instructions: AgentMem does not detect every pass or guarantee a user-visible summary or knowledge write. The former wrapper prompt commands and pass-boundary mechanism remain removed; no hook integration is active.
 
-```powershell
-& .\agentmem.ps1 prompt start --project-id agentmem
-& .\agentmem.ps1 prompt end-pass --project-id agentmem --pass-id '<wrapper-provided-pass-id>'
-```
+## Repository indexing service
 
-Inject the `prompt` field into the same agent at project entry/resume and after each caller work pass. The wrapper must supply a stable pass identifier, detect the pass boundary, and mark the resulting review turn so it does not inject another end-pass prompt recursively. Startup guidance points the agent to the compact brief, page map, mandatory task requirements and approvals; end-pass guidance reviews only the scoped pass, records supported durable deltas through existing AgentMem APIs, and asks for `no_changes` when no write is needed.
+The repository-indexing service is a distinct service and storage area in the AgentMem package; it does not reuse or merge the knowledge-base evidence corpus. Register each repository or Git worktree explicitly from the MCP with `repository_register(project_id, repository_root)`. Save the returned `repository_id`, then use `repository_list`, `repository_status`, `repository_search`, and `repository_resync`. Search results cite repository-relative paths and line ranges and report the indexed hash, whether the current file still matches, the index revision, and watcher freshness. Use KB tools for authored requirements, decisions, and work records; use repository tools for current code; use both to compare code with recorded intent.
 
-AgentMem does not observe turns or deliver prompts. This is an instruction contract, not automatic capture, a completion gate, or proof that the model followed it. The external wrapper is separate and is not configured by this repository. One Desktop continuation was observed during the earlier hook experiment, but future reliability and cross-client activation were not established; the AgentMem lifecycle-hook code and registration have since been removed. The prior project-local handler was uninstalled while unrelated project/user/Git hooks and user-wide Codex configuration were left alone.
+The MCP process starts a bounded filesystem-event watcher for registered roots. It batches saved-file changes briefly, indexes changed files (including edits whose size and modification time are preserved), removes deleted or newly excluded files, and reconciles the whole tree on startup. Periodic metadata reconciliation recovers missed events when file metadata changed; if a filesystem event is lost for an edit that preserves size and modification time, call `repository_resync`. A per-worktree OS lock elects one watcher across multiple MCP clients; a separate writer lock serializes explicit resync requests with the watcher. Searches read the last committed SQLite FTS snapshot. If the watcher is stopped or misses a change, status reports pending events when observed; call `repository_resync` before relying on results. The watcher runs only while an AgentMem MCP process is alive; it is not an installed or machine-wide daemon.
 
-`AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it defaults to `D:\projects` on Windows. `--data-dir` and `--memory-root` are also available in the CLI. To inspect the registered command, run `codex mcp get agentmem`.
+`AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it uses its platform default when unset. `--data-dir` and `--memory-root` are also available in the CLI. To inspect the registered command, run `codex mcp get agentmem`.
 
 ## Storage layout and migration
 
-`D:\projects\<project_id>\agentmem.sqlite3` is authoritative for that project's tasks, dependencies, claims/checkpoints, receipts, lessons, requirements, decisions, proposals, approvals and histories, source hashes, and FTS evidence index. `D:\projects\<project_id>\PROJECT.md` is a compact brief and navigation page. Detailed narrative lives in `D:\projects\<project_id>\knowledge\` (purpose, architecture, risks, history, and materials by default). `requirements.md`, `decisions.md`, and `approvals.md` are generated views of SQLite records; do not create editable duplicates in topic pages. `D:\projects\<project_id>\.agentmem-project.json` identifies the KB and source root. The app registry contains only project ID, source root, description, and KB path so it can route requests. Source files stay in their original repositories; the index stores cited text excerpts and hashes, not copies of those repositories.
+The per-project `agentmem.sqlite3` is authoritative for that project's tasks, dependencies, claims/checkpoints, receipts, lessons, requirements, decisions, proposals, approvals and histories, source hashes, and FTS evidence index. `PROJECT.md` is a compact brief and navigation page. Detailed narrative lives in `knowledge/` (purpose, architecture, risks, history, and materials by default). `requirements.md`, `decisions.md`, and `approvals.md` are generated views of SQLite records; do not create editable duplicates in topic pages. A project manifest identifies the knowledge base and source root. The app registry contains only project ID, source root, description, and KB path so it can route requests. Source files stay in their original repositories; the index stores cited text excerpts and hashes, not copies of those repositories.
 
 New registrations create five empty topic pages with “Not documented yet” placeholders and a linked brief; they do not invent project facts. For a previously registered project without a `knowledge` directory, run `knowledge init <project_id>`. It only creates missing pages and preserves the existing brief and pages. Review and add brief navigation separately with `update_project_brief` if needed.
 
@@ -65,8 +77,8 @@ Try prompts like:
 
 - “Attach to the `agentmem` project and explain what this module does. Cite the project files you used, and tell me what is not indexed or known.”
 - “Attach to `agentmem`, show the topic-page inventory, then read the architecture and risks pages. Explain how project facts are stored and cite the relevant lines.”
-- “For project `sunflower`, what are the current API constraints? Attach the project with this question and answer from its cited evidence.”
-- “For project `sunflower`, add a task to verify the controller change. Set acceptance criteria, authorized paths, and relevant dependencies. Do not start it yet.”
+- “For project `example-project`, what are the current API constraints? Attach the project with this question and answer from its cited evidence.”
+- “For project `example-project`, add a task to verify the controller change. Set acceptance criteria, authorized paths, and relevant dependencies. Do not start it yet.”
 - “For `agentmem`, list ready and blocked tasks. Claim the top ready task as `codex-main`, inspect its context and applicable lessons, then continue working. Save a checkpoint before a long investigation and record an evidence-backed receipt afterward.”
 - “Propose a lesson from this task, but keep it a candidate until we review its scope and evidence.”
 - “Record this plan as a proposal, show me the exact snapshot, and wait for my explicit approval before linking it to gated work.”
@@ -89,7 +101,7 @@ Requirement `lifecycle` governs whether it applies (`proposed`, `current`, `supe
 Example MCP flow:
 
 ```text
-requirements(action="create", project_id="sunflower", title="Keep public API stable",
+requirements(action="create", project_id="example-project", title="Keep public API stable",
   statement="Do not remove existing public methods without explicit approval.",
   original_quote="Keep the existing public API compatible.",
   interpretation="A breaking removal needs approval; additions are allowed.",
@@ -97,13 +109,13 @@ requirements(action="create", project_id="sunflower", title="Keep public API sta
   scope={"project_wide":true}, source_type="user_conversation",
   source_ref="current Codex conversation", idempotency_key="capture-api-rule-01")
 
-tasks(action="create", project_id="sunflower", title="Refactor controller",
+tasks(action="create", project_id="example-project", title="Refactor controller",
   goal="Improve controller internals without breaking the public API.",
   components=["controller"], requirement_ids=["REQ-0001"],
   acceptance=["tests pass", "existing API remains compatible"])
 
-claim_task(project_id="sunflower", task_id="...", owner="codex-main")
-task_context(project_id="sunflower", task_id="...")
+claim_task(project_id="example-project", task_id="...", owner="codex-main")
+task_context(project_id="example-project", task_id="...")
 ```
 
 When recording completion, include the `requirements_revision` returned by `task_context`, and a `requirement_checks` entry for each applicable requirement with its ID, revision, `met=true`, and evidence. This check means the agent reviewed and complied with the requirement in this task; it does not claim the requirement is globally fulfilled. The usual task acceptance checks still apply. The receipt does not automatically mark a requirement fulfilled; record that explicitly with `requirements(action="fulfill", expected_revision=..., fulfillment="fulfilled", fulfillment_evidence=[...], idempotency_key=...)` only when the evidence warrants it. Create a replacement with `supersedes_id` before marking the previous requirement superseded. Use `requirements(action="history")` or `decisions(action="history")` to inspect prior revisions. If a generated `requirements.md` or `decisions.md` was manually edited, `sync` reports a conflict; use `sync(force=true)` only after deciding to preserve the file's edits in the automatic backup.
@@ -123,16 +135,16 @@ Proposal revisions and approval events are retained. If proposal text or a pinne
 Example MCP flow:
 
 ```text
-proposals(action="create", project_id="sunflower", title="Controller rollout",
+proposals(action="create", project_id="example-project", title="Controller rollout",
   content="Replace the internals while preserving the public API.",
   targets=[{"kind":"requirement","id":"REQ-0001","revision":2}],
   approval_required=true, created_by="codex-main", idempotency_key="rollout-draft-1")
-proposals(action="show", project_id="sunflower", proposal_id="PRP-0001")
-proposals(action="approve", project_id="sunflower", proposal_id="PRP-0001",
+proposals(action="show", project_id="example-project", proposal_id="PRP-0001")
+proposals(action="approve", project_id="example-project", proposal_id="PRP-0001",
   expected_revision=1, original_quote="Yes, approve this exact rollout.",
   source_type="user_conversation", source_ref="current Codex conversation",
   recorded_by="user-supplied wording", idempotency_key="rollout-approved-1")
-tasks(action="create", project_id="sunflower", title="Implement controller rollout",
+tasks(action="create", project_id="example-project", title="Implement controller rollout",
   approval_proposal_id="PRP-0001", acceptance=["tests pass"])
 ```
 
@@ -141,41 +153,41 @@ Use `proposals(action="status"|"history"|"approval-history")` before work when t
 ## CLI
 
 ```powershell
-& '<path-to-agentmem-checkout>\agentmem.ps1' project list
-& '<path-to-agentmem-checkout>\agentmem.ps1' project resolve --cwd '<path-to-sunflower-checkout>'
-& '<path-to-agentmem-checkout>\agentmem.ps1' index sunflower
-& '<path-to-agentmem-checkout>\agentmem.ps1' check sunflower
-& '<path-to-agentmem-checkout>\agentmem.ps1' search sunflower 'controller API constraints'
-& '<path-to-agentmem-checkout>\agentmem.ps1' task list sunflower
-& '<path-to-agentmem-checkout>\agentmem.ps1' export sunflower > sunflower-agentmem-export.json
-& '<path-to-agentmem-checkout>\agentmem.ps1' requirement create sunflower --title 'Keep API stable' --statement 'Do not remove public methods without approval.' --quote 'Keep the public API compatible.' --scope-json '{"project_wide":true}' --source-type user_conversation --source-ref 'current Codex conversation' --idempotency-key capture-api-01
-& '<path-to-agentmem-checkout>\agentmem.ps1' requirement list sunflower --lifecycle current
-& '<path-to-agentmem-checkout>\agentmem.ps1' requirement history sunflower --id REQ-0001
-& '<path-to-agentmem-checkout>\agentmem.ps1' task-context sunflower --id '<TASK_ID>'
-& '<path-to-agentmem-checkout>\agentmem.ps1' decision list sunflower
-& '<path-to-agentmem-checkout>\agentmem.ps1' decision history sunflower --id DEC-0001
-& '<path-to-agentmem-checkout>\agentmem.ps1' proposal create sunflower --title 'Controller rollout' --content 'Preserve the public API while replacing internals.' --targets-json '[{"kind":"requirement","id":"REQ-0001","revision":2}]' --approval-required --created-by codex-main --idempotency-key rollout-draft-1
-& '<path-to-agentmem-checkout>\agentmem.ps1' proposal show sunflower --id PRP-0001
-& '<path-to-agentmem-checkout>\agentmem.ps1' proposal approve sunflower --id PRP-0001 --expected-revision 1 --quote 'Yes, approve this exact rollout.' --source-type user_conversation --source-ref 'current Codex conversation' --recorded-by 'user-supplied wording' --idempotency-key rollout-approved-1
-& '<path-to-agentmem-checkout>\agentmem.ps1' proposal status sunflower --id PRP-0001
-& '<path-to-agentmem-checkout>\agentmem.ps1' proposal approval-history sunflower --id PRP-0001
-& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge init sunflower
-& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge list sunflower
-& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge read sunflower --id architecture
-& '<path-to-agentmem-checkout>\agentmem.ps1' knowledge history sunflower --id architecture
+agentmem project list
+agentmem project resolve --cwd '<path-to-example-project-checkout>'
+agentmem index example-project
+agentmem check example-project
+agentmem search example-project 'controller API constraints'
+agentmem task list example-project
+agentmem export example-project > example-project-agentmem-export.json
+agentmem requirement create example-project --title 'Keep API stable' --statement 'Do not remove public methods without approval.' --quote 'Keep the public API compatible.' --scope-json '{"project_wide":true}' --source-type user_conversation --source-ref 'current Codex conversation' --idempotency-key capture-api-01
+agentmem requirement list example-project --lifecycle current
+agentmem requirement history example-project --id REQ-0001
+agentmem task-context example-project --id '<TASK_ID>'
+agentmem decision list example-project
+agentmem decision history example-project --id DEC-0001
+agentmem proposal create example-project --title 'Controller rollout' --content 'Preserve the public API while replacing internals.' --targets-json '[{"kind":"requirement","id":"REQ-0001","revision":2}]' --approval-required --created-by codex-main --idempotency-key rollout-draft-1
+agentmem proposal show example-project --id PRP-0001
+agentmem proposal approve example-project --id PRP-0001 --expected-revision 1 --quote 'Yes, approve this exact rollout.' --source-type user_conversation --source-ref 'current Codex conversation' --recorded-by 'user-supplied wording' --idempotency-key rollout-approved-1
+agentmem proposal status example-project --id PRP-0001
+agentmem proposal approval-history example-project --id PRP-0001
+agentmem knowledge init example-project
+agentmem knowledge list example-project
+agentmem knowledge read example-project --id architecture
+agentmem knowledge history example-project --id architecture
 ```
 
-To add a page, supply a lowercase slug, title, and body text: `knowledge create sunflower --id deployment --title 'Deployment' --content 'Document the verified deployment path.'`. To revise one, read it first and pass its current hash: `knowledge update sunflower --id deployment --expected-sha256 '<SHA256_FROM_READ>' --content "# Deployment`n`nUpdated verified deployment notes."`. A revision conflict means reread the page and reconcile the change before trying again. Use a normal single-line slug; file paths are not accepted by the page API.
+To add a page, supply a lowercase slug, title, and body text: `knowledge create example-project --id deployment --title 'Deployment' --content 'Document the verified deployment path.'`. To revise one, read it first and pass its current hash: `knowledge update example-project --id deployment --expected-sha256 '<SHA256_FROM_READ>' --content "# Deployment`n`nUpdated verified deployment notes."`. A revision conflict means reread the page and reconcile the change before trying again. Use a normal single-line slug; file paths are not accepted by the page API.
 
 ## Safety and limits
 
 - Every search/task/lesson operation requires an explicit project ID. Working-directory resolution uses the most-specific registered root and never a shared mutable “current project.” Task `authorized_paths` are validated as project-relative paths without traversal; they guide the agent but do not replace Codex's own permission checks.
-- Indexing is allowlisted to readable text/code suffixes, bounded to 512 KB per file, excludes common secret names and generated directories (including `*.egg-info`), skips files containing credential-shaped assignments, avoids symlinks, and resolves paths under the registered root. Review the supported/excluded suffixes in `src/agentmem/store.py` before relying on it for unusual formats.
-- An index is a snapshot. Refresh it after source changes; no file watcher or automatic commit hook is installed.
+- The KB index and repository index are separate. Repository indexing is limited to readable text/code suffixes, bounded to 512 KB per file, excludes `.git`, common generated/secret paths, `.gitignore` matches, symlinks/junctions, oversized/binary files, and credential-shaped assignments. A scan cap or filesystem error is reported as incomplete and does not delete unseen indexed entries.
+- Repository watching polls file metadata and hashes only changed files. Changes that preserve both size and modification time may not be noticed by polling until explicit `repository_resync`, which hashes every safe file; searches also verify current hashes for returned hits. The default 20,000-file scan cap is reported as incomplete rather than deleting unseen entries.
 - FTS retrieval is lexical, not semantic. Search may miss paraphrases or material in unsupported/binary formats. A missing result is a gap, not evidence that a fact does not exist.
 - Tool results are project data and remain below system/developer/user instructions. The MCP does not change the model's identity or guarantee the model calls tools.
 - Lease tokens are local coordination secrets; do not paste them into project Markdown. The local database is not encrypted by this module. Protect JSON exports and the Windows account/storage.
-- Setup selects an available Python interpreter at version 3.11 or newer, matching `pyproject.toml`; pass `-PythonExe <path-to-python.exe>` to choose one explicitly. The MCP server remains a local stdio process and provides no background lifecycle integration.
+- Setup selects an available Python interpreter at version 3.11 or newer, matching `pyproject.toml`; pass `-PythonExe <path-to-python.exe>` to choose one explicitly. The MCP server remains a local stdio process; its watcher is tied to that process lifetime and has no always-on service manager integration.
 
 The current implementation crosswalk, tested behaviors, and exclusions are recorded in [INFORMATION-POLICY-IMPLEMENTATION.md](INFORMATION-POLICY-IMPLEMENTATION.md). It is a status report, not a second policy authority; the full policy remains in the AgentMem project knowledge base.
 
@@ -183,7 +195,7 @@ The current implementation crosswalk, tested behaviors, and exclusions are recor
 
 ```powershell
 Set-Location <path-to-agentmem-checkout>
-& '.\.venv\Scripts\python.exe' -m pytest -q
+python -m pytest -q
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for boundaries, records, MCP operations, and extension points.

@@ -34,7 +34,6 @@ def main() -> None:
     p=sub.add_parser("lesson",help="record and retrieve reviewed project lessons"); p.add_argument("action",choices=["propose","retrieve","review","show"]); p.add_argument("project_id"); p.add_argument("--id",default=""); p.add_argument("--query",default=""); p.add_argument("--title",default=""); p.add_argument("--trigger",default=""); p.add_argument("--procedure",default=""); p.add_argument("--evidence",action="append",default=None); p.add_argument("--outcome",default=""); p.add_argument("--confirmed-cause",default=""); p.add_argument("--hypothesis",action="append",default=None); p.add_argument("--environment-json",default=None); p.add_argument("--precondition",action="append",default=None); p.add_argument("--exclusion-json",action="append",default=None); p.add_argument("--source-task-id",default=""); p.add_argument("--status",default=""); p.add_argument("--supersedes",default="")
     p=sub.add_parser("export"); p.add_argument("project_id")
     p=sub.add_parser("import",help="restore structured records from an AgentMem JSON export into an empty ledger"); p.add_argument("project_id"); p.add_argument("json_file")
-    p=sub.add_parser("prompt",help="print a wrapper-injectable AgentMem workflow prompt"); p.add_argument("phase",choices=["start","end-pass"]); p.add_argument("--project-id",required=True); p.add_argument("--pass-id",default="")
     args=parser.parse_args(); store=MemoryStore(args.data_dir,args.memory_root)
     try:
         if args.command=="project":
@@ -45,10 +44,6 @@ def main() -> None:
         elif args.command=="index": result=store.index_project(args.project_id,args.max_files)
         elif args.command=="check": result=store.check_project_changes(args.project_id,args.max_files)
         elif args.command=="search": result=store.search(args.project_id,args.query,args.limit)
-        elif args.command=="prompt":
-            from .prompts import build_prompt
-            store.get_project(args.project_id)
-            result=build_prompt(args.phase,args.project_id,args.pass_id)
         elif args.command=="knowledge":
             if args.action=="init": result=store.initialize_knowledge(args.project_id)
             elif args.action=="list": result=store.list_knowledge_pages(args.project_id,args.limit,args.offset)

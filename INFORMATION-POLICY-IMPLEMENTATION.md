@@ -16,7 +16,8 @@ ledger.
 | Freshness and evidence excerpts | The metadata scan is labelled metadata_scan_only. Citation search reads and hashes the current safe source before calling it content_checked; changed, missing, unreadable, or unsafe sources receive explicit states. Reindexing hashes full contents, so same-size/preserved-mtime edits are detected when content is checked. Excerpts center around lexical/CJK hit terms and retain valid line ranges. Secret-named files and files with credential-shaped assignments are skipped and removed from the current index on reindex. | Content freshness is checked at search time; it does not reindex the source or prove a fact remains true. Direct Markdown edits require index_project. tests/test_information_policy.py covers same-size/preserved-mtime edits, removal, deep hits, CJK hits, and secret-shaped content. |
 | Setup and portability | Setup discovers the Python launcher or interpreter, validates Python 3.11+ to match pyproject.toml, accepts an explicit interpreter path, and gives actionable failures. AGENTMEM_MEMORY_ROOT and --memory-root remain supported. Schema migrations back up before additive upgrades and serialize concurrent startup migration through the shared registry. | Windows PowerShell parsing and Python 3.13 execution were checked. No Linux/macOS setup run was available in this pass. Migration/round-trip tests use temporary project databases; no other registered KB was migrated. |
 | Search-quality evaluation | Reproducible fixtures cover exact and overlapping-paraphrase lexical retrieval, cross-topic and project-isolated content, Chinese bigram fallback, wrong/unknown lesson environments, changed and removed sources, deep hits, large approval quotes, requirement continuation, and serialized budgets. | The observed implementation remains lexical FTS5 with a CJK bigram fallback. No vector, embedding, cloud, or semantic service was added: the fixtures provide no evidence that an optional recall layer is necessary enough to justify its new dependency. Exact ranking/recall is not guaranteed, and no performance target is claimed. |
-| Wrapper-injected prompts | `agentmem prompt start --project-id <ID>` and `agentmem prompt end-pass --project-id <ID> --pass-id <CALLER_ID>` return JSON with concise, project-scoped startup and same-agent end-pass instructions. | `tests/test_prompts.py` checks scope, mandatory context guidance, no-op/write-failure reporting, pass metadata, and non-recursion. The caller wrapper must determine boundaries and deliver the prompt; AgentMem does not observe turns or guarantee capture. The wrapper itself is not configured here. |
+| Project recording and pass summary | `attach_project` includes a concise reminder to record important information in the selected project's AgentMem knowledge base and to briefly report knowledge pages/entries changed or state no project knowledge changes at the end of the work pass. It distinguishes repository indexing from knowledge ingestion. | `tests/test_recording_reminder.py` and `tests/test_mcp_repository.py` verify the scoped guidance and MCP instructions. The calling agent chooses what to save. AgentMem does not detect every pass or guarantee a write or visible summary. |
+| Repository indexing service | A separate `RepositoryIndexService` stores project/worktree indexes and FTS chunks in `AGENTMEM_DATA_DIR/repository-index/repositories.sqlite3`; it does not merge with the per-project KB database. MCP exposes `repository_register`, `repository_list`, `repository_status`, `repository_search`, and `repository_resync`, with source-relative path/line citations, hashes, and freshness. | `tests/test_repository.py` and `tests/test_mcp_repository.py` cover incremental updates, deletion, ignored/secret files, partial scans, worktree identity, watcher failover, concurrent reads/resyncs, and MCP routing. One cross-process watcher lease subscribes to debounced filesystem events and periodically reconciles metadata while an MCP process runs; startup scans catch preserved-metadata changes. If an event is lost for a same-size/same-mtime edit, use `repository_resync`. It is not an always-on daemon. |
 
 ## Teacher-reported defects
 
@@ -34,15 +35,15 @@ ledger.
 
 ## Runtime boundaries and remaining exclusions
 
-Codex lifecycle-hook integration has been removed. The AgentMem-owned
+Codex lifecycle-hook integration remains removed. The AgentMem-owned
 project-local registration was uninstalled from a config that contained only
-that AgentMem entry; user-wide settings and unrelated Git hooks were left
-untouched. One Desktop continuation was observed during the
-earlier experiment; its future reliability and cross-client activation were not
-established. No hook code or hidden fallback remains. Prompt delivery belongs
-to the caller wrapper, which is not included or configured here. The
-information-policy page remains a draft and is not represented as adopted by
-this implementation task.
+that AgentMem entry. The wrapper-specific prompt commands and pass-boundary
+mechanism have also been removed. Agent-facing project context carries a
+recording reminder and short end-of-pass summary instruction; the calling agent
+decides what matters and whether to write it through the selected project's
+scoped APIs. AgentMem cannot detect every pass or guarantee capture or display.
+The information-policy page remains a draft and is not represented as adopted
+by this implementation task.
 
 Semantic search, vector aliases, embeddings, and external services remain
 optional and are not included. AgentMem stores and retrieves project data; it

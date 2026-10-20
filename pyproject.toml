@@ -1,13 +1,29 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentmem-local"
 version = "0.1.0"
 description = "Project-scoped memory and work tracking exposed as a local Codex MCP"
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+keywords = ["agent", "memory", "mcp", "project-management"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 requires-python = ">=3.11"
-dependencies = ["mcp>=2.0,<3"]
+dependencies = ["mcp>=2.0,<3", "watchdog>=6.0,<7"]
 
 [project.scripts]
 agentmem = "agentmem.cli:main"

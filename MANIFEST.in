@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+include ARCHITECTURE.md
+include INFORMATION-POLICY-IMPLEMENTATION.md
+include PROJECT-AGENTS.template.md
+include DISTRIBUTION.md
+recursive-include src/agentmem *.py
+recursive-include tests *.py

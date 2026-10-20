@@ -60,7 +60,12 @@ class AgentMemError(ValueError):
         return {"code": self.code, "reason": self.reason, "recovery": self.recovery}
 
 
-class MemoryStore:
+class KnowledgeBaseService:
+    """Project-scoped knowledge and work-record service.
+
+    Connections are opened per operation, so this service has no persistent
+    worker to stop. ``MemoryStore`` remains a compatibility name for callers.
+    """
     def __init__(self, data_dir: Path | str | None = None, memory_root: Path | str | None = None):
         self.data_dir = Path(data_dir or DEFAULT_DATA).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,6 +1041,8 @@ class MemoryStore:
             if scope.get("project_wide"):
                 invariants.append({"id":r["id"],"title":r["title"],"statement":r["statement"],"fulfillment":r["fulfillment"],"revision":r["revision"]})
         card = {"project": {k: project[k] for k in ("id", "name", "root", "memory_root", "description")},
+                "recording_reminder": "Record any important information from this work in the current project's AgentMem knowledge base.",
+                "end_of_pass_summary_reminder": "At pass end, list KB entries/pages changed or say ‘No knowledge changes.’ Repository indexing is code indexing, not KB ingestion. MCP cannot detect every pass or guarantee display.",
                 "manager_brief": brief, "knowledge_pages":knowledge_pages,"tasks": task_list,
                 "requirements":{"revision":int(rv["requirements_revision"]) if rv else 0,"current_count":len(current_reqs),"proposed_count":int(proposed_req_count),"decisions_revision":int(rv["decisions_revision"]) if rv else 0,
                                 "project_wide":invariants[:8],"project_wide_truncated":len(invariants)>8,
@@ -1086,7 +1093,10 @@ class MemoryStore:
                 card["source_change_summary"]={k:change_summary[k] for k in ("changed_count","new_count","deleted_count","scan_truncated")}
                 card["freshness_note"]="Packet compacted to fit the requested size."
             if len(_json(card)) > max_chars:
-                card={"project":{"id":project_id,"name":project["name"]},"source_revision":self.source_revision(project_id),
+                card={"project":{"id":project_id,"name":project["name"]},
+                      "recording_reminder":"Record any important information from this work in the current project's AgentMem knowledge base.",
+                      "end_of_pass_summary_reminder":"At pass end, list KB entries/pages changed or say ‘No knowledge changes.’ Repository indexing is code indexing, not KB ingestion. MCP cannot detect every pass or guarantee display.",
+                      "source_revision":self.source_revision(project_id),
                       "requirements":{"revision":int(rv["requirements_revision"]) if rv else 0,"current_count":len(current_reqs),"decisions_revision":int(rv["decisions_revision"]) if rv else 0,"project_wide_truncated":True,"current_decisions_truncated":True,"truncated":True,"retrieve_action":"Call requirements or decisions for full records."},
                       "source_change_summary":{k:change_summary[k] for k in ("changed_count","new_count","deleted_count","scan_truncated")},"truncated":True}
         if query.strip():
@@ -1112,12 +1122,18 @@ class MemoryStore:
                 card["question_context"]["results_omitted_for_budget"]=omitted
             if len(_json(card))>max_chars:
                 first=card["question_context"]["results"][:1]
-                card={"project":{"id":project_id,"name":project["name"]},"source_revision":self.source_revision(project_id),
+                card={"project":{"id":project_id,"name":project["name"]},
+                      "recording_reminder":"Record any important information from this work in the current project's AgentMem knowledge base.",
+                      "end_of_pass_summary_reminder":"At pass end, list KB entries/pages changed or say ‘No knowledge changes.’ Repository indexing is code indexing, not KB ingestion. MCP cannot detect every pass or guarantee display.",
+                      "source_revision":self.source_revision(project_id),
                       "requirements":{"revision":int(rv["requirements_revision"]) if rv else 0,"current_count":len(current_reqs),"decisions_revision":int(rv["decisions_revision"]) if rv else 0,"truncated":True,"retrieve_action":"Call requirements or decisions for full records."},
                       "question_context":{"query":query,"results":first,"gap":evidence["gap"],"truncated":True,"results_omitted_for_budget":max(0,len(evidence["results"])-len(first))},"truncated":True}
         if len(_json(card))>max_chars:
             context=card.get("question_context",{})
-            final={"project":{"id":project_id},"source_revision":card.get("source_revision",self.source_revision(project_id)),
+            final={"project":{"id":project_id},
+                "recording_reminder":"Record any important information from this work in the current project's AgentMem knowledge base.",
+                "end_of_pass_summary_reminder":"At pass end, list KB entries/pages changed or say ‘No knowledge changes.’ Repository indexing is code indexing, not KB ingestion. MCP cannot detect every pass or guarantee display.",
+                "source_revision":card.get("source_revision",self.source_revision(project_id)),
                 "requirements":{"revision":int(rv["requirements_revision"]) if rv else 0,"current_count":len(current_reqs),
                     "truncated":True,"retrieve_action":"Call task_context or requirements for mandatory full records."},
                 "truncated":True,"omissions":["brief","page inventory","task list","full requirement text"]}
@@ -2617,3 +2633,7 @@ class MemoryStore:
                 "history_id":history_id,"retained_in_history":True,"erasure_complete":False,
                 "retention_note":"The service history copy remains available; external exports, filesystem backups, and Git copies are outside this operation.",
                 "source_revision":self.source_revision(project_id)}
+
+
+# Backwards-compatible import name retained for the existing CLI and callers.
+MemoryStore = KnowledgeBaseService

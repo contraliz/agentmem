@@ -85,6 +85,7 @@ def test_stdio_server_lists_and_calls_tools(tmp_path: Path):
             attached=await client.call_tool("attach_project",{"project_id":"pilot"})
             attach_ms=(time.perf_counter()-started)*1000
             assert attached.structured_content["project"]["id"]=="pilot"
+            assert attached.structured_content["recording_reminder"] == "Record any important information from this work in the current project's AgentMem knowledge base."
             assert len(str(attached.structured_content))<6500
             assert attached.structured_content["indexed_sources"]==[]
             assert attached.structured_content["indexed_source_count"]==12

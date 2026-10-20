@@ -4,25 +4,24 @@ Agent Memory is one reusable project-memory module inside a larger project-work 
 
 ```text
 Codex / future manager runtime
-      | MCP or CLI
-      v
-small locator registry
-      | project_id -> source_root + knowledge_root
-      v
-per-project SQLite + focused Markdown under D:/projects/<project_id>
-      |                          (authority: SQLite records + knowledge pages)
-      +-- source allowlist and incremental FTS index
-      +-- projects, tasks/dependencies/leases/checkpoints
-      +-- append-only receipts and lesson review/application
-      +-- versioned proposals, exact approvals, and opt-in task gates
-      ^
-      | original project source roots remain where they are; indexed evidence stores paths, hashes, and excerpts
+      | one MCP gateway
+      +------------------------------+
+      v                              v
+KnowledgeBaseService          RepositoryIndexService
+      |                              |
+project locator registry      shared repository-index SQLite + FTS
+      |                              | one elected watcher per worktree
+      v                              v
+per-project SQLite + pages     original repository/worktree roots
+under the configured memory root   remain at their registered locations
 ```
+
+The two services live in the same installable AgentMem package. The gateway registers their tools but keeps their APIs, lifecycles, and storage distinct. `KnowledgeBaseService` is the former `MemoryStore` implementation and retains the `MemoryStore` import name for existing callers. It opens and closes a SQLite connection per operation and owns no background thread. `RepositoryIndexService` owns a separate rebuildable corpus and a process-lifetime watcher coordinator. Its `start()` and `stop()` lifecycle is tied to the MCP server process; no machine-wide daemon is installed.
 
 ## Authority and records
 
-- Each project has an independent AgentMem knowledge directory, default `D:/projects/<project_id>`. `PROJECT.md` is a compact editable brief/navigation entry point; `knowledge/*.md` holds focused narrative topics such as purpose, architecture, risks, history, and materials. New registrations create empty, clearly marked topic scaffolds; explicit `knowledge(init)` fills only missing pages for an older project and never overwrites the brief or existing pages. The per-project `agentmem.sqlite3` is authoritative for task state, dependencies, lease ownership, checkpoints, receipts, lesson review status, requirements, decisions, proposals, approval events and revision histories, and the rebuildable evidence index. `requirements.md`, `decisions.md`, and `approvals.md` are generated projections from SQLite, not independent editable authorities; the service detects manual edits and preserves them as a conflict until an explicit forced regeneration makes a backup. The MCP writes knowledge pages only below that project's `knowledge/` directory and never accepts arbitrary output paths.
-- The app-level registry contains only `project_id`, source root, description, and knowledge-directory path. It routes each request to that project's database; all project content and working state lives in the corresponding per-project directory. `AGENTMEM_DATA_DIR` controls the registry and migration backups, while `AGENTMEM_MEMORY_ROOT` controls the default knowledge-directory parent.
+- Each project has an independent AgentMem knowledge directory, under the configured memory root. `PROJECT.md` is a compact editable brief/navigation entry point; `knowledge/*.md` holds focused narrative topics such as purpose, architecture, risks, history, and materials. New registrations create empty, clearly marked topic scaffolds; explicit `knowledge(init)` fills only missing pages for an older project and never overwrites the brief or existing pages. The per-project `agentmem.sqlite3` is authoritative for task state, dependencies, lease ownership, checkpoints, receipts, lesson review status, requirements, decisions, proposals, approval events and revision histories, and the rebuildable evidence index. `requirements.md`, `decisions.md`, and `approvals.md` are generated projections from SQLite, not independent editable authorities; the service detects manual edits and preserves them as a conflict until an explicit forced regeneration makes a backup. The MCP writes knowledge pages only below that project's `knowledge/` directory and never accepts arbitrary output paths.
+- The app-level project registry contains only `project_id`, source root, description, and knowledge-directory path. It routes each knowledge-base request to that project's database. `AGENTMEM_DATA_DIR` controls the locator registry, migration backups, and the separate `repository-index/` database/locks; `AGENTMEM_MEMORY_ROOT` controls the default knowledge-directory parent.
 - Before opening a project's database, AgentMem validates that the registered knowledge directory, project manifest, source-root binding, and database file still match the project and have not been replaced with a symlink/junction or moved path.
 - Source repositories remain at their existing roots. Index records retain relative paths, SHA-256, line bounds, and excerpt text; they are not copies of the original repository. A citation beginning `@memory/` resolves under the project's KB directory, while other citations resolve under the registered source root.
 - Every indexed source records a project ID, relative path, SHA-256, and index time. FTS chunks carry line bounds and source hash. Search returns excerpts and citations rather than unverified “facts.”
@@ -69,6 +68,11 @@ The MCP initialization instructions provide a short cross-tool onboarding workfl
 | `index_project` | Refresh project source snapshot and FTS index |
 | `check_project_changes` | Metadata-only freshness scan; does not read file contents |
 | `retrieve_evidence` | Lexical search with path, line, hash, freshness, and gap |
+| `repository_register` | Explicitly register a repository/worktree under a project and build its separate initial index |
+| `repository_list` | List repository/worktree identities registered for a project |
+| `repository_status` | Inspect indexed revision, watcher health, pending changes, freshness, and last error |
+| `repository_search` | Search one repository/worktree with path/line citations and current-content hashes |
+| `repository_resync` | Hash and reconcile a registered tree, including metadata-preserving edits |
 | `tasks` | Create, list, show, or edit unclaimed open work items |
 | `tasks(action="revise-acceptance")` | Change in-progress criteria under the lease, retaining source attribution and revision history |
 | `tasks(action="history")` | Read prior task acceptance revisions and source attribution |
@@ -85,11 +89,21 @@ The MCP initialization instructions provide a short cross-tool onboarding workfl
 
 CLI commands call the same domain/store methods and do not duplicate memory logic. Future parent-system adapters can use Python service methods or add an API without changing the record model. Planned extension points include semantic retrieval, external source connectors, a dashboard, Postgres for multi-host writes, and a separately authorized job runner. None is required by the current local module.
 
+## Repository indexing lifecycle
+
+Repository registrations are explicit and project-scoped. The repository ID is stable for the project plus canonical worktree path, so two linked Git worktrees receive separate snapshots even when they share a branch. The service records Git common directory, branch, HEAD, and dirty state as snapshot provenance. The index uses `AGENTMEM_DATA_DIR/repository-index/repositories.sqlite3`; it has separate `repositories`, `repository_files`, and FTS5 `repository_chunks` tables from the knowledge-base database. The legacy KB `index_project` and `retrieve_evidence` APIs remain compatible and still search their existing source-plus-KB corpus; the new repository tools do not merge with that corpus.
+
+Each MCP process starts one coordinator thread. A cross-process OS lock elects one watcher owner per repository/worktree; a second lock serializes manual resync with watcher writes. The elected owner subscribes to filesystem events, waits for a short debounce, reads and hashes changed safe files (including same-size edits with restored timestamps), and publishes one SQLite transaction. A periodic metadata reconciliation recovers missed events when size or modification time changed; if an event is lost for an edit that preserves both, explicit `repository_resync` is needed. Search readers see the last committed snapshot. At startup or after a watcher-owner change, the new owner reconciles the registered tree. The watcher exists only while an MCP process is alive. If no MCP process is connected, it is stopped; the next connection reconciles on startup.
+
+Search results report source-relative path, line range, indexed SHA-256, a current-content hash check, index revision, Git snapshot metadata, watcher health, and freshness. Filesystem events force hashing of affected paths, including edits whose size and modification time are restored. Periodic metadata reconciliation and startup `repository_resync` recover from missed events; metadata-only reconciliation cannot detect a missed same-size, same-mtime edit. A scan limit or filesystem error marks the snapshot incomplete and never deletes rows unseen in a partial traversal. Safe-file rules exclude Git/generated/dependency directories, `.gitignore` matches, symlinks and junctions, unsupported or binary files, files over 512 KB, secret names, and credential-shaped content.
+
+`attach_project` returns a compact service catalog with configured repository/worktree IDs and freshness, plus routing hints: use KB tools for recorded decisions and tasks, repository tools for current code, and both to compare implementation with intent. The end-of-pass context reminder asks for a brief list of knowledge pages/entries changed or an explicit no-knowledge-changes statement, and says repository indexing is not knowledge ingestion. MCP does not observe every pass or guarantee tool use or visible summaries.
+
+The former wrapper prompt commands and caller pass-boundary mechanism remain removed. Codex lifecycle hooks remain removed; the earlier project-local hook experiment is historical context only.
+
 ## Current operational limits
 
-The first version uses lexical FTS5 and manual re-indexing. It does not provide file watching, semantic search, automatic extraction/verification of all facts, concurrent multi-machine synchronization, remote hosting, or autonomous Codex scheduling. The CLI can print reusable startup and end-of-pass prompt payloads for a caller-controlled wrapper. It does not observe turns, deliver prompts, or guarantee a write. Prompts direct the same caller agent to use existing AgentMem APIs and to avoid writes when there is no durable delta; they are instructions, not enforcement. Continue to cite evidence and surface missing/stale sources.
-
-`agentmem prompt start --project-id <ID>` and `agentmem prompt end-pass --project-id <ID> --pass-id <CALLER_ID>` return JSON payloads after verifying the registered project. The wrapper supplies pass metadata, triggers only at the caller's chosen boundary, delivers to the same agent, and suppresses recursive review prompts. The removed Codex Stop-hook experiment is historical; the project-local registration was uninstalled and AgentMem no longer includes its hook runtime or installer.
+Both corpora use lexical FTS5; no embeddings, semantic guarantee, call graph, or automatic fact extraction is provided. The repository watcher is filesystem-event based with periodic reconciliation, process-bound, and not an always-on daemon. Multi-machine coordination, remote hosting, and autonomous Codex scheduling remain out of scope. The calling agent decides what to save as durable knowledge and whether to act on evidence; prompt instructions cannot guarantee capture or tool choice.
 
 For common question answering, `attach_project(project_id, query=...)` combines orientation and up to three capped citation excerpts in one MCP call. This saves one agent/tool round trip when both operations are needed. The normal packet gives the indexed-source count and revision without listing every hash; cited evidence still carries its own source hash. Pass `include_sources=true` when the detailed manifest is needed. Larger or ambiguous questions should use `retrieve_evidence` for more results. Local tool latency does not measure model reasoning or end-to-end answer time.
 
