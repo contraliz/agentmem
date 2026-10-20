@@ -34,28 +34,18 @@ When an agent starts a new KB through the MCP, it should first confirm the exact
 
 If the project owner wants persistent project-specific Codex guidance, review [PROJECT-AGENTS.template.md](PROJECT-AGENTS.template.md) and merge suitable instructions into that project's existing `AGENTS.md`; do not overwrite existing instructions. `update_project_brief` writes only to the AgentMem-owned `PROJECT.md` inside that project's registered knowledge directory; original source repositories are read for evidence and are never used as the KB storage location.
 
-## Optional project-local end-of-pass review hook
+## Wrapper-injected prompts
 
-AgentMem can install an opt-in Codex `Stop` hook for one registered project. From the AgentMem checkout, run:
-
-```powershell
-& .\agentmem.ps1 hooks install --project-id agentmem --root (Get-Location).Path
-& .\agentmem.ps1 hooks status --project-id agentmem --root (Get-Location).Path
-```
-
-The installer verifies the exact registered source root and merges one marked handler into that project's `.codex/hooks.json`. It does not change user-wide Codex settings or trust. The generated local config is ignored by Git because it contains machine-specific interpreter and registry paths. Codex requires review and trust of the exact project-local hook before running it. The documented review flow is `/hooks` in the Codex CLI; App Server `hooks/list` only discovers hooks ([Hooks](https://learn.chatgpt.com/docs/hooks), [App Server](https://learn.chatgpt.com/docs/app-server)). A Desktop-native trust/review control has not been verified. Project-local hooks also require the project config layer to be trusted.
-
-For Desktop use, the currently documented path is to review the exact project hook with `/hooks` in the Codex CLI first, then start a fresh local Desktop turn in the same project. This does not prove that Desktop shares the CLI's hook-trust state or has reloaded the config. Confirm an actual callback before relying on automatic prompting; installation or discovery alone is not activation evidence. Do not use the CLI trust-bypass flag.
-
-At a normal Codex Stop boundary, the hook asks the same Codex session for one short continuation to review only that just-finished pass. The prompt directs the agent to save useful information through the existing AgentMem APIs, preserving provenance and distinctions, or report `no_changes`. Codex sets `stop_hook_active` on that continuation, so the hook lets it finish without asking for another review. A session/turn key suppresses duplicate callbacks while allowing later turns. The hook itself never calls a model or writes knowledge; it can only request a continuation, and it cannot prove that the agent completed the review or that capture is complete. The original turn continues if the hook errors, the project is unregistered/mismatched, or the hook is not trusted; a visible warning is returned when the callback can report one.
-
-To remove only the AgentMem handler while preserving other hooks in the project file:
+AgentMem provides small prompt payloads for a caller-controlled wrapper. The CLI validates the registered project ID and prints JSON containing the prompt:
 
 ```powershell
-& .\agentmem.ps1 hooks uninstall --project-id agentmem --root (Get-Location).Path
+& .\agentmem.ps1 prompt start --project-id agentmem
+& .\agentmem.ps1 prompt end-pass --project-id agentmem --pass-id '<wrapper-provided-pass-id>'
 ```
 
-The reusable protocol and configuration behavior are covered by local tests. A live normal-trust CLI or Desktop continuation has not been verified here. Desktop configuration discovery, host trust, session loading, and actual callback execution are separate states; installation alone proves none of the latter three. Review and trust the local hook before relying on it.
+Inject the `prompt` field into the same agent at project entry/resume and after each caller work pass. The wrapper must supply a stable pass identifier, detect the pass boundary, and mark the resulting review turn so it does not inject another end-pass prompt recursively. Startup guidance points the agent to the compact brief, page map, mandatory task requirements and approvals; end-pass guidance reviews only the scoped pass, records supported durable deltas through existing AgentMem APIs, and asks for `no_changes` when no write is needed.
+
+AgentMem does not observe turns or deliver prompts. This is an instruction contract, not automatic capture, a completion gate, or proof that the model followed it. The external wrapper is separate and is not configured by this repository. One Desktop continuation was observed during the earlier hook experiment, but future reliability and cross-client activation were not established; the AgentMem lifecycle-hook code and registration have since been removed. The prior project-local handler was uninstalled while unrelated project/user/Git hooks and user-wide Codex configuration were left alone.
 
 `AGENTMEM_DATA_DIR` selects the locator registry and migration-backup location. `AGENTMEM_MEMORY_ROOT` selects the default parent for per-project KBs; it defaults to `D:\projects` on Windows. `--data-dir` and `--memory-root` are also available in the CLI. To inspect the registered command, run `codex mcp get agentmem`.
 
@@ -185,9 +175,9 @@ To add a page, supply a lowercase slug, title, and body text: `knowledge create 
 - FTS retrieval is lexical, not semantic. Search may miss paraphrases or material in unsupported/binary formats. A missing result is a gap, not evidence that a fact does not exist.
 - Tool results are project data and remain below system/developer/user instructions. The MCP does not change the model's identity or guarantee the model calls tools.
 - Lease tokens are local coordination secrets; do not paste them into project Markdown. The local database is not encrypted by this module. Protect JSON exports and the Windows account/storage.
-- Setup selects an available Python interpreter at version 3.11 or newer, matching `pyproject.toml`; pass `-PythonExe <path-to-python.exe>` to choose one explicitly. The MCP server remains a local stdio process and receives no hook or background lifecycle integration.
+- Setup selects an available Python interpreter at version 3.11 or newer, matching `pyproject.toml`; pass `-PythonExe <path-to-python.exe>` to choose one explicitly. The MCP server remains a local stdio process and provides no background lifecycle integration.
 
-The current non-hook implementation crosswalk, tested behaviors, and exclusions are recorded in [INFORMATION-POLICY-IMPLEMENTATION.md](INFORMATION-POLICY-IMPLEMENTATION.md). It is a status report, not a second policy authority; the full policy remains in the AgentMem project knowledge base.
+The current implementation crosswalk, tested behaviors, and exclusions are recorded in [INFORMATION-POLICY-IMPLEMENTATION.md](INFORMATION-POLICY-IMPLEMENTATION.md). It is a status report, not a second policy authority; the full policy remains in the AgentMem project knowledge base.
 
 ## Development checks
 

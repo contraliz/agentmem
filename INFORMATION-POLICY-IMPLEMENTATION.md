@@ -1,9 +1,9 @@
 # Information policy implementation crosswalk
 
-This file records the current implementation of the non-hook portions of the
-AgentMem information policy. The complete policy in the AgentMem knowledge base
-remains authoritative. This crosswalk reports behavior and verification; it
-does not create a second editable record ledger.
+This file records current AgentMem information-policy behavior. The complete
+policy in the AgentMem knowledge base remains authoritative. This crosswalk
+reports behavior and verification; it does not create a second editable record
+ledger.
 
 ## Current coverage
 
@@ -16,7 +16,7 @@ does not create a second editable record ledger.
 | Freshness and evidence excerpts | The metadata scan is labelled metadata_scan_only. Citation search reads and hashes the current safe source before calling it content_checked; changed, missing, unreadable, or unsafe sources receive explicit states. Reindexing hashes full contents, so same-size/preserved-mtime edits are detected when content is checked. Excerpts center around lexical/CJK hit terms and retain valid line ranges. Secret-named files and files with credential-shaped assignments are skipped and removed from the current index on reindex. | Content freshness is checked at search time; it does not reindex the source or prove a fact remains true. Direct Markdown edits require index_project. tests/test_information_policy.py covers same-size/preserved-mtime edits, removal, deep hits, CJK hits, and secret-shaped content. |
 | Setup and portability | Setup discovers the Python launcher or interpreter, validates Python 3.11+ to match pyproject.toml, accepts an explicit interpreter path, and gives actionable failures. AGENTMEM_MEMORY_ROOT and --memory-root remain supported. Schema migrations back up before additive upgrades and serialize concurrent startup migration through the shared registry. | Windows PowerShell parsing and Python 3.13 execution were checked. No Linux/macOS setup run was available in this pass. Migration/round-trip tests use temporary project databases; no other registered KB was migrated. |
 | Search-quality evaluation | Reproducible fixtures cover exact and overlapping-paraphrase lexical retrieval, cross-topic and project-isolated content, Chinese bigram fallback, wrong/unknown lesson environments, changed and removed sources, deep hits, large approval quotes, requirement continuation, and serialized budgets. | The observed implementation remains lexical FTS5 with a CJK bigram fallback. No vector, embedding, cloud, or semantic service was added: the fixtures provide no evidence that an optional recall layer is necessary enough to justify its new dependency. Exact ranking/recall is not guaranteed, and no performance target is claimed. |
-| End-of-pass hook | `agentmem hooks install/status/uninstall` merges or removes one marked Codex `Stop` handler in the verified project's `.codex/hooks.json`. The callback validates the registered root and working-directory owner, deduplicates by session/turn, and requests one same-instance review continuation; `stop_hook_active` prevents a continuation loop. | Local contract and configuration behavior are tested. Current project config is installed but still requires Codex trust review. Official docs expose App Server `hooks/list` for discovery and `/hooks` in the CLI for review/trust; they do not document a Desktop trust mutation route. A CLI-review-then-fresh-Desktop-session path is documented as a bounded workaround, but shared trust and config reload are unverified. Normal-trust CLI and Desktop callback behavior remain unverified. The handler only requests a review; it does not invoke a model, write memory, prove a review ran, or guarantee complete capture. |
+| Wrapper-injected prompts | `agentmem prompt start --project-id <ID>` and `agentmem prompt end-pass --project-id <ID> --pass-id <CALLER_ID>` return JSON with concise, project-scoped startup and same-agent end-pass instructions. | `tests/test_prompts.py` checks scope, mandatory context guidance, no-op/write-failure reporting, pass metadata, and non-recursion. The caller wrapper must determine boundaries and deliver the prompt; AgentMem does not observe turns or guarantee capture. The wrapper itself is not configured here. |
 
 ## Teacher-reported defects
 
@@ -34,14 +34,15 @@ does not create a second editable record ledger.
 
 ## Runtime boundaries and remaining exclusions
 
-The opt-in project-local Codex Stop handler is implemented. The installer does
-not modify user-wide hooks or trust; Codex requires review/trust of the local
-hook definition before it runs. SessionStart/compaction hooks, wrappers,
-scheduled triggers, background services, external model calls, and plugin
-packaging remain out of scope. Normal-trust live CLI and Desktop smoke tests
-have not been completed. Hook delivery, durable writes, complete capture, and
-host context retention are not guaranteed. The information-policy page remains
-a draft and is not represented as adopted by this implementation task.
+Codex lifecycle-hook integration has been removed. The AgentMem-owned
+project-local registration was uninstalled from a config that contained only
+that AgentMem entry; user-wide settings and unrelated Git hooks were left
+untouched. One Desktop continuation was observed during the
+earlier experiment; its future reliability and cross-client activation were not
+established. No hook code or hidden fallback remains. Prompt delivery belongs
+to the caller wrapper, which is not included or configured here. The
+information-policy page remains a draft and is not represented as adopted by
+this implementation task.
 
 Semantic search, vector aliases, embeddings, and external services remain
 optional and are not included. AgentMem stores and retrieves project data; it

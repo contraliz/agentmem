@@ -34,7 +34,7 @@ def main() -> None:
     p=sub.add_parser("lesson",help="record and retrieve reviewed project lessons"); p.add_argument("action",choices=["propose","retrieve","review","show"]); p.add_argument("project_id"); p.add_argument("--id",default=""); p.add_argument("--query",default=""); p.add_argument("--title",default=""); p.add_argument("--trigger",default=""); p.add_argument("--procedure",default=""); p.add_argument("--evidence",action="append",default=None); p.add_argument("--outcome",default=""); p.add_argument("--confirmed-cause",default=""); p.add_argument("--hypothesis",action="append",default=None); p.add_argument("--environment-json",default=None); p.add_argument("--precondition",action="append",default=None); p.add_argument("--exclusion-json",action="append",default=None); p.add_argument("--source-task-id",default=""); p.add_argument("--status",default=""); p.add_argument("--supersedes",default="")
     p=sub.add_parser("export"); p.add_argument("project_id")
     p=sub.add_parser("import",help="restore structured records from an AgentMem JSON export into an empty ledger"); p.add_argument("project_id"); p.add_argument("json_file")
-    p=sub.add_parser("hooks",help="install and inspect project-local Codex lifecycle hooks"); p.add_argument("action",choices=["install","status","uninstall"]); p.add_argument("--project-id",required=True); p.add_argument("--root",required=True); p.add_argument("--python",default=sys.executable)
+    p=sub.add_parser("prompt",help="print a wrapper-injectable AgentMem workflow prompt"); p.add_argument("phase",choices=["start","end-pass"]); p.add_argument("--project-id",required=True); p.add_argument("--pass-id",default="")
     args=parser.parse_args(); store=MemoryStore(args.data_dir,args.memory_root)
     try:
         if args.command=="project":
@@ -45,6 +45,10 @@ def main() -> None:
         elif args.command=="index": result=store.index_project(args.project_id,args.max_files)
         elif args.command=="check": result=store.check_project_changes(args.project_id,args.max_files)
         elif args.command=="search": result=store.search(args.project_id,args.query,args.limit)
+        elif args.command=="prompt":
+            from .prompts import build_prompt
+            store.get_project(args.project_id)
+            result=build_prompt(args.phase,args.project_id,args.pass_id)
         elif args.command=="knowledge":
             if args.action=="init": result=store.initialize_knowledge(args.project_id)
             elif args.action=="list": result=store.list_knowledge_pages(args.project_id,args.limit,args.offset)
@@ -120,11 +124,6 @@ def main() -> None:
             elif args.action=="review": result=store.review_lesson(args.project_id,args.id,args.status,args.supersedes)
             else: result=store.get_lesson(args.project_id,args.id)
         elif args.command=="export": result=store.export_project(args.project_id)
-        elif args.command=="hooks":
-            from . import hooks
-            if args.action=="install": result=hooks.install(args.project_id,args.root,str(store.data_dir),args.python)
-            elif args.action=="status": result=hooks.status(args.project_id,args.root,str(store.data_dir))
-            else: result=hooks.uninstall(args.project_id,args.root,str(store.data_dir))
         else:
             payload=json.loads(Path(args.json_file).read_text(encoding="utf-8"))
             result=store.import_project(args.project_id,payload)
