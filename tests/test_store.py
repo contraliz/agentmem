@@ -72,6 +72,8 @@ def test_incremental_index_excludes_secrets_and_symlinks(setup):
     (root/".env").write_text("alpha SECRET_DO_NOT_INDEX",encoding="utf-8")
     (root/"credentials.json").write_text("alpha credential",encoding="utf-8")
     (root/"node_modules").mkdir(); (root/"node_modules"/"lib.md").write_text("alpha ignored",encoding="utf-8")
+    repo_state=Path(store.get_project("p")["memory_root"])/"repository-index"
+    repo_state.mkdir(); (repo_state/"marker.md").write_text("alpha repository corpus is separate",encoding="utf-8")
     first=store.index_project("p"); second=store.index_project("p")
     # A newly registered project includes safe, intentionally empty KB scaffolds.
     assert first["files_changed"]==9
@@ -79,6 +81,7 @@ def test_incremental_index_excludes_secrets_and_symlinks(setup):
     result=store.search("p","alpha")
     assert len(result["results"])==1 and result["results"][0]["citation"].startswith("guide.md#L")
     assert "SECRET_DO_NOT_INDEX" not in str(result)
+    assert "repository corpus is separate" not in str(result)
 
 
 def test_generated_egg_info_is_excluded_from_index_and_freshness(setup):

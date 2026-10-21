@@ -6,6 +6,7 @@ import time
 import os
 import sys
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,13 +19,22 @@ def make_service(tmp_path: Path, *, max_files: int = 100):
     root = tmp_path / "repo"
     root.mkdir(parents=True, exist_ok=True)
     data = tmp_path / "state"
+    projects = []
+    for project_id in ("p", "other"):
+        memory_root = tmp_path / "kb" / project_id
+        memory_root.mkdir(parents=True, exist_ok=True)
+        marker = memory_root / ".agentmem-project.json"
+        if not marker.exists():
+            marker.write_text(json.dumps({"project_id": project_id, "source_root": str(root), "format": 1}), encoding="utf-8")
+        projects.append({"id": project_id, "root": str(root), "memory_root": str(memory_root)})
 
     def project_lookup(project_id: str):
-        if project_id not in {"p", "other"}:
+        project = next((item for item in projects if item["id"] == project_id), None)
+        if project is None:
             raise ValueError("Unknown project")
-        return {"id": project_id, "root": str(root), "memory_root": str(tmp_path / "kb" / project_id)}
+        return project
 
-    return RepositoryIndexService(data, project_lookup, poll_interval=0.1,
+    return RepositoryIndexService(data, project_lookup, project_list=lambda: projects, poll_interval=0.1,
                                    debounce_seconds=0.15, max_files=max_files), root
 
 
@@ -126,6 +136,87 @@ def test_repository_ids_and_indexes_are_project_scoped_and_worktree_scoped(tmp_p
         service.stop()
 
 
+def test_repository_databases_and_locks_live_under_each_project_knowledge_root(tmp_path: Path):
+    service, root = make_service(tmp_path)
+    (root / "code.py").write_text("layoutmigrationmarker = True\n", encoding="utf-8")
+    try:
+        p_repo = service.register("p", root)["repository_id"]
+        other_repo = service.register("other", root)["repository_id"]
+        p_db, p_locks = service._project_storage("p")
+        other_db, other_locks = service._project_storage("other")
+        assert p_db == tmp_path / "kb" / "p" / "repository-index" / "repositories.sqlite3"
+        assert other_db == tmp_path / "kb" / "other" / "repository-index" / "repositories.sqlite3"
+        assert p_db != other_db and p_locks != other_locks
+        assert not (tmp_path / "state" / "repository-index" / "repositories.sqlite3").exists()
+        assert service.search("p", p_repo, "layoutmigrationmarker")["results"]
+        assert service.search("other", other_repo, "layoutmigrationmarker")["results"]
+    finally:
+        service.stop()
+
+
+def test_legacy_shared_repository_database_migrates_to_project_store_and_is_backed_up(tmp_path: Path):
+    service, root = make_service(tmp_path)
+    source = root / "legacy.md"
+    source.write_text("legacyindexmigrationmarker retained\n", encoding="utf-8")
+    other_source = root / "other.md"
+    other_source.write_text("otherprojectindexmarker isolated\n", encoding="utf-8")
+    legacy_dir = tmp_path / "state" / "repository-index"
+    legacy_dir.mkdir(parents=True)
+    legacy_db = legacy_dir / "repositories.sqlite3"
+    repo_id = "repo-existing-id"
+    now = time.time()
+    with sqlite3.connect(legacy_db) as db:
+        RepositoryIndexService._init_db(db)
+        db.execute("INSERT INTO repositories(project_id,repository_id,root,index_revision,indexed_at,last_scan_complete,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                   ("p", repo_id, str(root.resolve()), 7, now, 1, now - 10, now))
+        db.execute("INSERT INTO repository_files(project_id,repository_id,relpath,sha256,size_bytes,mtime_ns,indexed_at) VALUES(?,?,?,?,?,?,?)",
+                   ("p", repo_id, "legacy.md", "abc", source.stat().st_size, source.stat().st_mtime_ns, now))
+        db.execute("INSERT INTO repository_chunks(project_id,repository_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?,?)",
+                   ("p", repo_id, "legacy.md", "abc", 1, 1, "legacyindexmigrationmarker retained"))
+        other_id = "repo-existing-other"
+        db.execute("INSERT INTO repositories(project_id,repository_id,root,index_revision,indexed_at,last_scan_complete,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                   ("other", other_id, str(root.resolve()), 3, now, 1, now - 10, now))
+        db.execute("INSERT INTO repository_files(project_id,repository_id,relpath,sha256,size_bytes,mtime_ns,indexed_at) VALUES(?,?,?,?,?,?,?)",
+                   ("other", other_id, "other.md", "def", other_source.stat().st_size, other_source.stat().st_mtime_ns, now))
+        db.execute("INSERT INTO repository_chunks(project_id,repository_id,relpath,sha256,line_start,line_end,body) VALUES(?,?,?,?,?,?,?)",
+                   ("other", other_id, "other.md", "def", 1, 1, "otherprojectindexmarker isolated"))
+    db.close()
+    project_lookup = service.project_lookup
+    service = RepositoryIndexService(tmp_path / "state", project_lookup,
+                                     project_list=lambda: [project_lookup("p"), project_lookup("other")],
+                                     poll_interval=0.1)
+    try:
+        assert not legacy_dir.exists()
+        backups = list((tmp_path / "state" / "migration-backups").glob("repository-index-legacy-*"))
+        assert len(backups) == 1
+        assert (backups[0] / "repositories.sqlite3").is_file()
+        assert service._project_storage("p")[0].is_file()
+        assert service.status("p", repo_id)["index_revision"] == 7
+        result = service.search("p", repo_id, "legacyindexmigrationmarker")["results"]
+        assert result[0]["citation"] == "legacy.md#L1-L1"
+        assert service.status("other", other_id)["index_revision"] == 3
+        assert service.search("other", other_id, "otherprojectindexmarker")["results"]
+        assert service._project_storage("p")[0] != service._project_storage("other")[0]
+    finally:
+        service.stop()
+
+
+def test_legacy_migration_keeps_source_when_project_identity_is_unavailable(tmp_path: Path):
+    service, root = make_service(tmp_path)
+    legacy_dir = tmp_path / "state" / "repository-index"
+    legacy_dir.mkdir(parents=True)
+    with sqlite3.connect(legacy_dir / "repositories.sqlite3") as db:
+        RepositoryIndexService._init_db(db)
+        now = time.time()
+        db.execute("INSERT INTO repositories(project_id,repository_id,root,created_at,updated_at) VALUES(?,?,?,?,?)",
+                   ("missing-project", "repo-legacy", str(root.resolve()), now, now))
+    db.close()
+    with pytest.raises(RuntimeError, match="unregistered projects"):
+        RepositoryIndexService(tmp_path / "state", service.project_lookup, project_list=lambda: [], poll_interval=0.1)
+    assert (legacy_dir / "repositories.sqlite3").is_file()
+    assert not (tmp_path / "state" / "migration-backups").exists()
+
+
 def test_repository_index_skips_symlinks_that_escape_the_registered_root(tmp_path: Path):
     service, root = make_service(tmp_path)
     outside = tmp_path / "outside.md"
@@ -209,8 +300,10 @@ def test_repository_watcher_lease_is_shared_across_processes(tmp_path: Path):
         child_code = r'''
 import json, sys, time
 from agentmem.repository import RepositoryIndexService
-data, root, repo_id = sys.argv[1:]
-service = RepositoryIndexService(data, lambda project_id: {"id": project_id}, poll_interval=0.1)
+data, root, repo_id, memory_root = sys.argv[1:]
+project = {"id": "p", "root": root, "memory_root": memory_root}
+service = RepositoryIndexService(data, lambda project_id: project,
+                                 project_list=lambda: [project], poll_interval=0.1)
 service.start()
 time.sleep(0.4)
 print(json.dumps(service.status("p", repo_id)))
@@ -219,7 +312,8 @@ service.stop()
         env = os.environ.copy()
         source_dir = str(Path(__file__).resolve().parents[1] / "src")
         env["PYTHONPATH"] = source_dir + os.pathsep + env.get("PYTHONPATH", "")
-        child = subprocess.run([sys.executable, "-c", child_code, str(tmp_path / "state"), str(root), repo_id],
+        child = subprocess.run([sys.executable, "-c", child_code, str(tmp_path / "state"), str(root), repo_id,
+                                str(tmp_path / "kb" / "p")],
                                env=env, capture_output=True, text=True, timeout=10, check=True)
         child_status = json.loads(child.stdout.strip().splitlines()[-1])
         assert child_status["watcher_pid"] == os.getpid()

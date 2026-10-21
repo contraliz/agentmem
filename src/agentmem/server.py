@@ -16,7 +16,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("agentmem")
 knowledge_base = KnowledgeBaseService(os.environ.get("AGENTMEM_DATA_DIR"), os.environ.get("AGENTMEM_MEMORY_ROOT"))
 store = knowledge_base  # Compatibility for existing server integrations.
-repository_service = RepositoryIndexService(knowledge_base.data_dir, knowledge_base.get_project)
+repository_service = RepositoryIndexService(
+    knowledge_base.data_dir, knowledge_base.get_project, project_list=knowledge_base.list_projects
+)
 mcp = MCPServer(
     "agentmem",
     instructions=(

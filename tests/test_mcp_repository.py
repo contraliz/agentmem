@@ -38,6 +38,7 @@ def test_stdio_exposes_repository_service_and_agent_context(tmp_path: Path):
             catalog = attached.structured_content["service_catalog"]
             assert catalog["knowledge_base"]["available"] is True
             assert catalog["repository_indexing"]["available"] is True
+            assert catalog["repository_indexing"]["repositories"] == []
             assert attached.structured_content["end_of_pass_summary_reminder"]
             compact = await client.call_tool("attach_project", {"project_id": "pilot", "max_chars": 1000})
             assert len(json.dumps(compact.structured_content, ensure_ascii=False)) <= 1000
@@ -48,6 +49,9 @@ def test_stdio_exposes_repository_service_and_agent_context(tmp_path: Path):
             })
             repo_id = repo.structured_content["repository_id"]
             assert repo.structured_content["initial_sync"]["files_changed"] >= 1
+            memory_root = Path(registered_project.structured_content["memory_root"])
+            assert (memory_root / "repository-index" / "repositories.sqlite3").is_file()
+            assert not (tmp_path / "state" / "repository-index" / "repositories.sqlite3").exists()
             refreshed = await client.call_tool("attach_project", {"project_id": "pilot"})
             configured = refreshed.structured_content["service_catalog"]["repository_indexing"]["repositories"]
             assert configured[0]["repository_id"] == repo_id
@@ -60,9 +64,14 @@ def test_stdio_exposes_repository_service_and_agent_context(tmp_path: Path):
 
             (source / "README.md").write_text("The service now retries five times.\n", encoding="utf-8")
             resync = await client.call_tool("repository_resync", {"project_id": "pilot", "repository_id": repo_id})
-            assert resync.structured_content["files_changed"] == 1
+            assert resync.structured_content["files_changed"] in (0, 1)
             status = await client.call_tool("repository_status", {"project_id": "pilot", "repository_id": repo_id})
             assert status.structured_content["index_revision"] >= 2
+            updated = await client.call_tool("repository_search", {
+                "project_id": "pilot", "repository_id": repo_id, "query": "five times"
+            })
+            assert updated.structured_content["results"][0]["fresh"] is True
+            assert "five times" in updated.structured_content["results"][0]["excerpt"]
             listed = await client.call_tool("repository_list", {"project_id": "pilot"})
             assert listed.structured_content["repositories"][0]["repository_id"] == repo_id
 

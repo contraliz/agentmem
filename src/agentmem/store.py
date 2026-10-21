@@ -16,7 +16,7 @@ from typing import Any
 
 DEFAULT_DATA = Path(os.environ.get("AGENTMEM_DATA_DIR", Path.home() / ".agentmem"))
 DEFAULT_MEMORY_ROOT = Path(os.environ.get("AGENTMEM_MEMORY_ROOT", "D:/projects" if os.name == "nt" else Path.home() / "projects"))
-EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "target", "__pycache__", ".agentmem-data", ".agentmem", ".history", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
+EXCLUDED_DIRS = {".git", ".venv", "venv", "node_modules", "dist", "build", "target", "__pycache__", ".agentmem-data", ".agentmem", "repository-index", ".history", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox"}
 SECRET_NAME = re.compile(r"(^|[._-])(\.env(?:\..*)?|secrets?|credentials?)([._-]|$)", re.I)
 SECRET_ASSIGNMENT = re.compile(r"(?i)(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|private[_-]?key)\s*[:=]\s*['\"]?([A-Za-z0-9_+/=-]{16,})")
 SECRET_SUFFIXES = {".pem", ".key", ".token", ".secret", ".p12", ".pfx", ".cer", ".crt", ".sqlite", ".db"}

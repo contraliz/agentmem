@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from watchdog.events import FileSystemEventHandler
@@ -116,6 +117,7 @@ class RepositoryIndexService:
         data_dir: Path | str,
         project_lookup: Callable[[str], dict[str, Any]],
         *,
+        project_list: Callable[[], list[dict[str, Any]]] | None = None,
         poll_interval: float = 1.0,
         debounce_seconds: float = 0.6,
         reconcile_interval: float = 60.0,
@@ -123,46 +125,74 @@ class RepositoryIndexService:
     ):
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.state_dir = self.data_dir / "repository-index"
         if _reparse(self.data_dir):
             raise ValueError("Repository index data directory cannot be a symlink or reparse point")
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        if _reparse(self.state_dir) or self.state_dir.resolve(strict=True).parent != self.data_dir:
-            raise ValueError("Repository index state directory is unsafe")
-        self.db_path = self.state_dir / "repositories.sqlite3"
-        self.lock_dir = self.state_dir / "locks"
-        self.lock_dir.mkdir(parents=True, exist_ok=True)
-        if _reparse(self.lock_dir) or self.lock_dir.resolve(strict=True).parent != self.state_dir:
-            raise ValueError("Repository index lock directory is unsafe")
         self.project_lookup = project_lookup
+        self.project_list = project_list or (lambda: [])
+        self._known_projects: set[str] = set()
         self.poll_interval = max(0.2, float(poll_interval))
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self.reconcile_interval = max(1.0, float(reconcile_interval))
         self.max_files = max(1, min(int(max_files), _MAX_SCAN_FILES))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._owners: dict[str, _ProcessLock] = {}
-        self._observers: dict[str, Observer] = {}
-        self._pending_since: dict[str, float] = {}
-        self._pending_paths: dict[str, set[str]] = {}
-        self._pending_full: set[str] = set()
-        self._last_reconcile: dict[str, float] = {}
+        self._owners: dict[tuple[str, str], _ProcessLock] = {}
+        self._observers: dict[tuple[str, str], Observer] = {}
+        self._pending_since: dict[tuple[str, str], float] = {}
+        self._pending_paths: dict[tuple[str, str], set[str]] = {}
+        self._pending_full: set[tuple[str, str]] = set()
+        self._last_reconcile: dict[tuple[str, str], float] = {}
         self._mutex = threading.RLock()
-        self._init_db()
+        self._migrate_legacy_index()
 
-    def _connect(self) -> sqlite3.Connection:
-        if self.db_path.exists() and _reparse(self.db_path):
+    def _project_storage(self, project_id: str, *, create: bool = True) -> tuple[Path, Path]:
+        project = self.project_lookup(project_id)
+        if project.get("id") != project_id:
+            raise ValueError("Project resolver returned a mismatched project identity")
+        memory_root = Path(project["memory_root"]).expanduser().absolute()
+        if _reparse(memory_root) or not memory_root.is_dir() or memory_root.resolve(strict=True) != memory_root:
+            raise ValueError("Registered project knowledge directory is missing or unsafe")
+        manifest = memory_root / ".agentmem-project.json"
+        if _reparse(manifest) or not manifest.is_file():
+            raise ValueError("Registered project knowledge manifest is missing or unsafe")
+        try:
+            metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("Registered project knowledge manifest is invalid") from exc
+        if metadata.get("project_id") != project_id:
+            raise ValueError("Project knowledge manifest does not match the registered project")
+        if Path(metadata.get("source_root", "")).expanduser().resolve() != Path(project["root"]).expanduser().resolve():
+            raise ValueError("Project knowledge manifest source root does not match the registry")
+        self._known_projects.add(project_id)
+        state_dir = memory_root / "repository-index"
+        if create:
+            state_dir.mkdir(exist_ok=True)
+        if state_dir.exists() and (_reparse(state_dir) or state_dir.resolve(strict=True).parent != memory_root):
+            raise ValueError("Repository index state directory is unsafe")
+        lock_dir = state_dir / "locks"
+        if create:
+            lock_dir.mkdir(exist_ok=True)
+        if lock_dir.exists() and (_reparse(lock_dir) or lock_dir.resolve(strict=True).parent != state_dir):
+            raise ValueError("Repository index lock directory is unsafe")
+        return state_dir / "repositories.sqlite3", lock_dir
+
+    def _connect(self, project_id: str) -> sqlite3.Connection:
+        db_path, _ = self._project_storage(project_id)
+        if db_path.exists() and _reparse(db_path):
             raise ValueError("Repository index database cannot be a symlink or reparse point")
-        db = sqlite3.connect(self.db_path, timeout=15, isolation_level=None)
+        initialize = not db_path.exists()
+        db = sqlite3.connect(db_path, timeout=15, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA busy_timeout=15000")
         db.execute("PRAGMA foreign_keys=ON")
+        if initialize:
+            self._init_db(db)
         return db
 
-    def _init_db(self) -> None:
-        with self._connect() as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.executescript("""
+    @staticmethod
+    def _init_db(db: sqlite3.Connection) -> None:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.executescript("""
                 CREATE TABLE IF NOT EXISTS repositories(
                     project_id TEXT NOT NULL,
                     repository_id TEXT NOT NULL,
@@ -199,7 +229,113 @@ class RepositoryIndexService:
                     sha256 UNINDEXED, line_start UNINDEXED, line_end UNINDEXED, body,
                     tokenize='unicode61 remove_diacritics 2'
                 );
-            """)
+        """)
+
+    def _ensure_project_db(self, project_id: str) -> None:
+        with self._connect(project_id) as db:
+            self._init_db(db)
+
+    def _migrate_legacy_index(self) -> None:
+        """Move the former shared index into per-project stores without discarding its source."""
+        legacy_dir = self.data_dir / "repository-index"
+        legacy_db = legacy_dir / "repositories.sqlite3"
+        if not legacy_db.exists():
+            return
+        if _reparse(legacy_dir) or _reparse(legacy_db):
+            raise ValueError("Legacy repository index is unsafe; preserve it and resolve before restart")
+        projects = {item["id"]: item for item in self.project_list()}
+        # Use an OS lock outside the directory so the source can be renamed after verification.
+        migration_lock = _ProcessLock(self.data_dir / "repository-index-migration.lock")
+        deadline = time.monotonic() + 30.0
+        while not migration_lock.acquire():
+            if not legacy_db.exists():
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Legacy repository index migration is active in another AgentMem process")
+            time.sleep(0.1)
+        try:
+            if not legacy_db.exists():
+                return
+            with tempfile.TemporaryDirectory(prefix="agentmem-repo-migrate-") as scratch:
+                snapshot = Path(scratch) / "legacy.sqlite3"
+                source = sqlite3.connect(legacy_db, timeout=15)
+                try:
+                    source.execute("PRAGMA busy_timeout=15000")
+                    target = sqlite3.connect(snapshot)
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
+                finally:
+                    source.close()
+                legacy = sqlite3.connect(snapshot)
+                legacy.row_factory = sqlite3.Row
+                try:
+                    integrity = legacy.execute("PRAGMA integrity_check").fetchone()[0]
+                    if integrity != "ok":
+                        raise RuntimeError(f"Legacy repository index failed integrity check: {integrity}")
+                    rows = [dict(row) for row in legacy.execute("SELECT * FROM repositories ORDER BY project_id,repository_id")]
+                    for project_id in {row["project_id"] for row in rows} - projects.keys():
+                        try:
+                            project = self.project_lookup(project_id)
+                        except ValueError:
+                            continue
+                        if project.get("id") != project_id:
+                            raise ValueError("Project resolver returned a mismatched project identity")
+                        projects[project_id] = project
+                    missing = sorted({row["project_id"] for row in rows} - projects.keys())
+                    if missing:
+                        raise RuntimeError("Legacy repository index references unregistered projects: " + ", ".join(missing))
+                    for repository in rows:
+                        project_id, repo_id = repository["project_id"], repository["repository_id"]
+                        self._ensure_project_db(project_id)
+                        with self._connect(project_id) as dest:
+                            dest.execute("BEGIN IMMEDIATE")
+                            current = dest.execute("SELECT * FROM repositories WHERE project_id=? AND repository_id=?",
+                                                   (project_id, repo_id)).fetchone()
+                            use_legacy = current is None or float(repository["updated_at"]) >= float(current["updated_at"])
+                            if use_legacy:
+                                dest.execute("DELETE FROM repository_chunks WHERE project_id=? AND repository_id=?", (project_id, repo_id))
+                                dest.execute("DELETE FROM repository_files WHERE project_id=? AND repository_id=?", (project_id, repo_id))
+                                columns = list(repository)
+                                dest.execute(f"INSERT OR REPLACE INTO repositories({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                                             [repository[column] for column in columns])
+                                for table in ("repository_files", "repository_chunks"):
+                                    source_rows = legacy.execute(f"SELECT * FROM {table} WHERE project_id=? AND repository_id=?",
+                                                                 (project_id, repo_id)).fetchall()
+                                    for source_row in source_rows:
+                                        data = dict(source_row)
+                                        cols = list(data)
+                                        dest.execute(f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
+                                                     [data[column] for column in cols])
+                            dest.commit()
+                            repo_count = dest.execute("SELECT COUNT(*) FROM repositories WHERE project_id=? AND repository_id=?",
+                                                      (project_id, repo_id)).fetchone()[0]
+                            if repo_count != 1:
+                                raise RuntimeError(f"Could not verify migrated repository {project_id}/{repo_id}")
+                            if use_legacy:
+                                for table in ("repository_files", "repository_chunks"):
+                                    expected = legacy.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id=? AND repository_id=?",
+                                                              (project_id, repo_id)).fetchone()[0]
+                                    actual = dest.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id=? AND repository_id=?",
+                                                          (project_id, repo_id)).fetchone()[0]
+                                    if actual != expected:
+                                        raise RuntimeError(f"Could not verify migrated {table} for {project_id}/{repo_id}")
+                            integrity = dest.execute("PRAGMA integrity_check").fetchone()[0]
+                            if integrity != "ok":
+                                raise RuntimeError(f"Migrated project index failed integrity check: {integrity}")
+                    # Every source project/worktree is present and transactionally copied before preserving the source.
+                    backup_root = self.data_dir / "migration-backups"
+                    backup_root.mkdir(exist_ok=True)
+                    backup = backup_root / f"repository-index-legacy-{time.time_ns()}"
+                    legacy.close()
+                    legacy = None
+                    os.replace(legacy_dir, backup)
+                finally:
+                    if legacy is not None:
+                        legacy.close()
+        finally:
+            migration_lock.release()
 
     def start(self) -> None:
         """Start this MCP process's coordinator; a file lease elects one writer per worktree."""
@@ -237,6 +373,7 @@ class RepositoryIndexService:
 
     def _start_observer(self, row: dict[str, Any]) -> None:
         repo_id = row["repository_id"]
+        repo_key = (row["project_id"], repo_id)
         service = self
 
         class Handler(FileSystemEventHandler):
@@ -251,28 +388,38 @@ class RepositoryIndexService:
                     return
                 with service._mutex:
                     if getattr(event, "is_directory", False):
-                        service._pending_full.add(repo_id)
+                        service._pending_full.add(repo_key)
                     else:
-                        service._pending_paths.setdefault(repo_id, set()).add(rel)
-                    service._pending_since.setdefault(repo_id, time.monotonic())
+                        service._pending_paths.setdefault(repo_key, set()).add(rel)
+                    service._pending_since.setdefault(repo_key, time.monotonic())
 
         observer = Observer()
         observer.schedule(Handler(), str(row["root"]), recursive=True)
         observer.start()
-        self._observers[repo_id] = observer
+        self._observers[repo_key] = observer
 
-    def _stop_observer(self, repo_id: str) -> None:
-        observer = self._observers.pop(repo_id, None)
+    def _stop_observer(self, repo_key: tuple[str, str]) -> None:
+        observer = self._observers.pop(repo_key, None)
         if observer is not None:
             observer.stop()
             observer.join(timeout=2.0)
 
     def _repo_rows(self) -> list[dict[str, Any]]:
-        with self._connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM repositories ORDER BY project_id,repository_id")]
+        rows = []
+        projects = {item["id"]: item for item in self.project_list()}
+        for project_id in self._known_projects:
+            if project_id not in projects:
+                projects[project_id] = self.project_lookup(project_id)
+        for project in projects.values():
+            project_id = project["id"]
+            if not self._project_storage(project_id)[0].exists():
+                continue
+            with self._connect(project_id) as db:
+                rows.extend(dict(row) for row in db.execute("SELECT * FROM repositories ORDER BY repository_id"))
+        return rows
 
     def _repo_row(self, project_id: str, repository_id: str) -> dict[str, Any]:
-        with self._connect() as db:
+        with self._connect(project_id) as db:
             row = db.execute("SELECT * FROM repositories WHERE project_id=? AND repository_id=?", (project_id, repository_id)).fetchone()
         if not row:
             raise ValueError("Repository not found for this project; call repository_list to inspect registered roots")
@@ -315,12 +462,13 @@ class RepositoryIndexService:
         project = self.project_lookup(project_id)
         if project.get("id") != project_id:
             raise ValueError("Project resolver returned a mismatched project identity")
+        self._ensure_project_db(project_id)
         root = self._canonical_root(repository_root)
         normalized = os.path.normcase(str(root))
         repo_id = "repo-" + hashlib.sha256((project_id + "\0" + normalized).encode("utf-8")).hexdigest()[:20]
         git = self._git_metadata(root)
         now = time.time()
-        with self._connect() as db:
+        with self._connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             conflict = db.execute("SELECT repository_id FROM repositories WHERE project_id=? AND root=?", (project_id, str(root))).fetchone()
             if conflict:
@@ -339,7 +487,7 @@ class RepositoryIndexService:
 
     def list(self, project_id: str) -> dict[str, Any]:
         self.project_lookup(project_id)
-        with self._connect() as db:
+        with self._connect(project_id) as db:
             rows = [dict(row) for row in db.execute("SELECT * FROM repositories WHERE project_id=? ORDER BY root", (project_id,))]
         return {"project_id": project_id, "repositories": [self._public_status(row) for row in rows]}
 
@@ -524,9 +672,10 @@ class RepositoryIndexService:
     def _git_snapshot(self, root: Path) -> dict[str, Any]:
         return self._git_metadata(root)
 
-    def _writer_lock(self, repo_id: str, timeout: float = 15.0) -> _ProcessLock:
-        key = hashlib.sha256(repo_id.encode("utf-8")).hexdigest()
-        lock = _ProcessLock(self.lock_dir / (key + ".writer.lock"))
+    def _writer_lock(self, project_id: str, repo_id: str, timeout: float = 15.0) -> _ProcessLock:
+        _, lock_dir = self._project_storage(project_id)
+        key = hashlib.sha256((project_id + "\0" + repo_id).encode("utf-8")).hexdigest()
+        lock = _ProcessLock(lock_dir / (key + ".writer.lock"))
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if lock.acquire():
@@ -538,7 +687,7 @@ class RepositoryIndexService:
         self.project_lookup(project_id)
         row = self._repo_row(project_id, repository_id)
         max_files = max(1, min(int(max_files or self.max_files), _MAX_SCAN_FILES))
-        lock = self._writer_lock(repository_id)
+        lock = self._writer_lock(project_id, repository_id)
         try:
             return self._sync(project_id, repository_id, Path(row["root"]), max_files, force=True)
         finally:
@@ -549,7 +698,7 @@ class RepositoryIndexService:
               force_paths: set[str] | None = None) -> dict[str, Any]:
         started = time.time()
         candidates, truncated = self._metadata_scan(root, max_files)
-        with self._connect() as db:
+        with self._connect(project_id) as db:
             old = {row["relpath"]: dict(row) for row in db.execute(
                 "SELECT relpath,sha256,size_bytes,mtime_ns FROM repository_files WHERE project_id=? AND repository_id=?",
                 (project_id, repository_id))}
@@ -578,7 +727,7 @@ class RepositoryIndexService:
         content_changed = [item for item in changed if not item.get("unchanged_hash")]
         git = self._git_snapshot(root)
         now = time.time()
-        with self._connect() as db:
+        with self._connect(project_id) as db:
             db.execute("BEGIN IMMEDIATE")
             for item in changed:
                 if not item.get("unchanged_hash"):
@@ -614,7 +763,7 @@ class RepositoryIndexService:
     def _scan_diff(self, row: dict[str, Any]) -> tuple[int, bool]:
         root = Path(row["root"])
         candidates, truncated = self._metadata_scan(root, self.max_files)
-        with self._connect() as db:
+        with self._connect(row["project_id"]) as db:
             old = {item["relpath"]: dict(item) for item in db.execute(
                 "SELECT relpath,size_bytes,mtime_ns FROM repository_files WHERE project_id=? AND repository_id=?",
                 (row["project_id"], row["repository_id"]))}
@@ -626,7 +775,7 @@ class RepositoryIndexService:
 
     def _set_watch_state(self, row: dict[str, Any], pending: int, error: str = "") -> None:
         now = time.time()
-        with self._connect() as db:
+        with self._connect(row["project_id"]) as db:
             db.execute("UPDATE repositories SET watcher_pid=?,watcher_heartbeat=?,pending_count=?,last_error=?,updated_at=? WHERE project_id=? AND repository_id=?",
                        (os.getpid(), now, pending, error[:500], now, row["project_id"], row["repository_id"]))
 
@@ -637,38 +786,40 @@ class RepositoryIndexService:
             except sqlite3.Error:
                 self._stop.wait(self.poll_interval)
                 continue
-            current_ids = {row["repository_id"] for row in rows}
-            for repo_id in list(self._owners):
-                if repo_id not in current_ids:
-                    self._stop_observer(repo_id)
-                    self._owners.pop(repo_id).release()
-                    self._pending_since.pop(repo_id, None)
-                    self._pending_paths.pop(repo_id, None)
-                    self._pending_full.discard(repo_id)
-                    self._last_reconcile.pop(repo_id, None)
+            current_ids = {(row["project_id"], row["repository_id"]) for row in rows}
+            for repo_key in list(self._owners):
+                if repo_key not in current_ids:
+                    self._stop_observer(repo_key)
+                    self._owners.pop(repo_key).release()
+                    self._pending_since.pop(repo_key, None)
+                    self._pending_paths.pop(repo_key, None)
+                    self._pending_full.discard(repo_key)
+                    self._last_reconcile.pop(repo_key, None)
             for row in rows:
                 if self._stop.is_set():
                     break
                 repo_id = row["repository_id"]
-                owner = self._owners.get(repo_id)
+                repo_key = (row["project_id"], repo_id)
+                owner = self._owners.get(repo_key)
                 if owner is None:
-                    key = hashlib.sha256(repo_id.encode("utf-8")).hexdigest()
-                    owner = _ProcessLock(self.lock_dir / (key + ".watcher.lock"))
+                    _, lock_dir = self._project_storage(row["project_id"])
+                    key = hashlib.sha256((row["project_id"] + "\0" + repo_id).encode("utf-8")).hexdigest()
+                    owner = _ProcessLock(lock_dir / (key + ".watcher.lock"))
                     if owner.acquire():
-                        self._owners[repo_id] = owner
-                        self._pending_since[repo_id] = time.monotonic() - self.debounce_seconds
-                        self._pending_full.add(repo_id)
+                        self._owners[repo_key] = owner
+                        self._pending_since[repo_key] = time.monotonic() - self.debounce_seconds
+                        self._pending_full.add(repo_key)
                     else:
                         continue
-                observer = self._observers.get(repo_id)
+                observer = self._observers.get(repo_key)
                 if observer is None or not observer.is_alive():
                     if observer is not None:
-                        self._stop_observer(repo_id)
+                        self._stop_observer(repo_key)
                     try:
                         self._start_observer(row)
                         with self._mutex:
-                            self._pending_full.add(repo_id)
-                            self._pending_since.setdefault(repo_id, time.monotonic() - self.debounce_seconds)
+                            self._pending_full.add(repo_key)
+                            self._pending_since.setdefault(repo_key, time.monotonic() - self.debounce_seconds)
                     except (OSError, RuntimeError, ValueError) as exc:
                         try:
                             self._set_watch_state(row, 1, str(exc))
@@ -678,41 +829,41 @@ class RepositoryIndexService:
                 try:
                     now_mono = time.monotonic()
                     with self._mutex:
-                        pending_paths = set(self._pending_paths.get(repo_id, set()))
-                        full_scan = repo_id in self._pending_full
-                        pending = self._pending_since.get(repo_id, 0.0)
-                    reconcile = now_mono - self._last_reconcile.get(repo_id, 0.0) >= self.reconcile_interval
+                        pending_paths = set(self._pending_paths.get(repo_key, set()))
+                        full_scan = repo_key in self._pending_full
+                        pending = self._pending_since.get(repo_key, 0.0)
+                    reconcile = now_mono - self._last_reconcile.get(repo_key, 0.0) >= self.reconcile_interval
                     diff, truncated = self._scan_diff(row) if full_scan or reconcile else (len(pending_paths), False)
                     if diff or truncated or full_scan:
                         if pending == 0.0:
                             pending = time.monotonic()
                             with self._mutex:
-                                self._pending_since[repo_id] = pending
+                                self._pending_since[repo_key] = pending
                         self._set_watch_state(row, diff, "")
                         if time.monotonic() - pending >= self.debounce_seconds:
                             with self._mutex:
-                                pending_paths = set(self._pending_paths.pop(repo_id, set()))
-                                full_scan = repo_id in self._pending_full
-                                self._pending_full.discard(repo_id)
-                                self._pending_since.pop(repo_id, None)
-                            lock = self._writer_lock(repo_id)
+                                pending_paths = set(self._pending_paths.pop(repo_key, set()))
+                                full_scan = repo_key in self._pending_full
+                                self._pending_full.discard(repo_key)
+                                self._pending_since.pop(repo_key, None)
+                            lock = self._writer_lock(row["project_id"], repo_id)
                             try:
-                                force_all = full_scan and self._last_reconcile.get(repo_id, 0.0) == 0.0
+                                force_all = full_scan and self._last_reconcile.get(repo_key, 0.0) == 0.0
                                 result = self._sync(row["project_id"], repo_id, Path(row["root"]), self.max_files,
                                                     watcher_owner=True, force=force_all,
                                                     force_paths=pending_paths)
                             finally:
                                 lock.release()
-                            self._last_reconcile[repo_id] = time.monotonic()
+                            self._last_reconcile[repo_key] = time.monotonic()
                             if result["pending_changes"]:
                                 with self._mutex:
-                                    self._pending_since[repo_id] = time.monotonic()
+                                    self._pending_since[repo_key] = time.monotonic()
                     else:
                         with self._mutex:
-                            self._pending_since.pop(repo_id, None)
+                            self._pending_since.pop(repo_key, None)
                         self._set_watch_state(row, 0, "")
                         if reconcile:
-                            self._last_reconcile[repo_id] = now_mono
+                            self._last_reconcile[repo_key] = now_mono
                 except (OSError, sqlite3.Error, ValueError, TimeoutError, subprocess.SubprocessError) as exc:
                     try:
                         self._set_watch_state(row, 1, str(exc))
@@ -728,7 +879,7 @@ class RepositoryIndexService:
             raise ValueError("query must contain at least one searchable token")
         match = " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
         limit = max(1, min(int(limit), _MAX_RESULTS))
-        with self._connect() as db:
+        with self._connect(project_id) as db:
             rows = db.execute("""SELECT relpath,sha256,line_start,line_end,body,bm25(repository_chunks) AS score
                 FROM repository_chunks WHERE repository_chunks MATCH ? AND project_id=? AND repository_id=?
                 ORDER BY score LIMIT ?""", (match, project_id, repository_id, limit)).fetchall()
