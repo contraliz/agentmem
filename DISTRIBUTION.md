@@ -9,6 +9,8 @@ python scripts/build_distribution.py
 
 The command writes a wheel, source distribution, repository ZIP, and `SHA256SUMS.txt` under `dist/`. It uses the current working tree, including uncommitted and untracked source files. It excludes `.git`, local AgentMem data, virtual environments, generated caches/build outputs, local project instructions, and the Codex installer script. It does not publish artifacts or modify Git history.
 
+At runtime, `AGENTMEM_DATA_DIR` selects the project locator registry and migration-backup directory. If `AGENTMEM_MEMORY_ROOT` is unset, new per-project knowledge directories default to `~/.agentmem/projects` on every platform; set it to choose another parent. Changing this default does not move or rebind existing project registrations.
+
 AgentMem is licensed under MIT, as selected by the project owner. The license text is included in each source and package artifact. A PyPI or other registry upload still requires a separate release decision and a registry availability check for both the package name and version; local builds do not prove either name or version is available.
 
 The repository ZIP is intended for source review or local installation. It does not contain Git history or user-specific project state. The public history may contain previously disclosed personal commit metadata or path references; a clean artifact does not remove those historical copies. Review and authorize any history remediation separately.

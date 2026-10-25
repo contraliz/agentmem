@@ -23,6 +23,8 @@ from .store import (
     SECRET_SUFFIXES,
     SENSITIVE_BASENAMES,
     TEXT_SUFFIXES,
+    _cjk_bigrams,
+    _search_terms,
 )
 
 try:  # The watcher lease is advisory and released by the OS on process exit.
@@ -879,10 +881,31 @@ class RepositoryIndexService:
             raise ValueError("query must contain at least one searchable token")
         match = " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
         limit = max(1, min(int(limit), _MAX_RESULTS))
+        cjk_grams=_cjk_bigrams(query)
+        query_terms=_search_terms(query)
         with self._connect(project_id) as db:
-            rows = db.execute("""SELECT relpath,sha256,line_start,line_end,body,bm25(repository_chunks) AS score
+            fts_rows = db.execute("""SELECT relpath,sha256,line_start,line_end,body,bm25(repository_chunks) AS score
                 FROM repository_chunks WHERE repository_chunks MATCH ? AND project_id=? AND repository_id=?
-                ORDER BY score LIMIT ?""", (match, project_id, repository_id, limit)).fetchall()
+                ORDER BY score LIMIT ?""", (match, project_id, repository_id, limit*3)).fetchall()
+            cjk_rows=[]
+            if cjk_grams:
+                clauses=" OR ".join("instr(body,?)>0" for _ in cjk_grams)
+                score_expr=" + ".join("CASE WHEN instr(body,?)>0 THEN 1 ELSE 0 END" for _ in cjk_grams)
+                params=[*cjk_grams,project_id,repository_id,*cjk_grams,limit*3]
+                cjk_rows=db.execute(f"""SELECT relpath,sha256,line_start,line_end,body,
+                    ({score_expr}) AS score FROM repository_chunks WHERE project_id=? AND repository_id=?
+                    AND ({clauses}) ORDER BY score DESC,relpath,line_start LIMIT ?""",params).fetchall()
+            merged={}
+            for source_rank,source_rows in enumerate((fts_rows,cjk_rows)):
+                for rank,item in enumerate(source_rows):
+                    key=(item["relpath"],item["sha256"],item["line_start"],item["line_end"])
+                    record=merged.setdefault(key,{**dict(item),"fts_rank":None,"cjk_score":0})
+                    if source_rank==0: record["fts_rank"]=rank
+                    else: record["cjk_score"]=max(record["cjk_score"],int(item["score"]))
+            rows=sorted(merged.values(),key=lambda item:(
+                -(item["cjk_score"]*2+sum(1 for term in query_terms if term.casefold() in item["body"].casefold())),
+                item["fts_rank"] if item["fts_rank"] is not None else limit*3,
+                item["relpath"],item["line_start"]))[:limit]
         results = []
         root = Path(row["root"])
         for item in rows:
@@ -898,7 +921,7 @@ class RepositoryIndexService:
                 pass
             body = item["body"]
             folded = body.casefold()
-            positions = [folded.find(token.casefold()) for token in tokens if folded.find(token.casefold()) >= 0]
+            positions = [folded.find(token.casefold()) for token in query_terms if folded.find(token.casefold()) >= 0]
             hit = min(positions) if positions else 0
             excerpt_start = max(0, min(hit - 1_200, max(0, len(body) - 2_400)))
             excerpt = body[excerpt_start:excerpt_start + 2_400]

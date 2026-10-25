@@ -25,7 +25,8 @@ mcp = MCPServer(
         "Project identity is explicit: use a project_id or resolve a registered cwd; never guess a project/root or adopt/overwrite a KB. "
         "For a new KB, confirm its ID and source root, call projects(action=register), index safe files, attach or retrieve cited evidence, curate focused pages, and report verified facts and gaps. "
         "Registration creates empty scaffolding, not verified knowledge. For an existing registration, inspect context and freshness before setup. "
-        "Cite factual answers and retrieve accepted lessons before acting. Capture explicit user requirements and decisions with source wording; keep interpretations proposed. "
+        "Cite factual answers and retrieve accepted lessons before acting. Apply a lesson procedure only when its applicability outcome is applicable; otherwise treat it as a candidate and resolve every listed missing condition first. Keep the lesson's environment, preconditions, exclusions, applicability, and missing-information data with its procedure, including in compacted packets. "
+        "Capture explicit user requirements and decisions with source wording; keep interpretations proposed. "
         "Fulfillment does not retire a current requirement. Record approvals only from explicit user wording and pin exact versions. "
         "Record evidence-backed task receipts. Use the knowledge-base service for recorded requirements, decisions, plans, and task state; use repository tools for current source code; use both when comparing code with project intent. "
         "Repository search returns source citations and freshness; resync if stale. Repository indexing is separate from curated project knowledge. "
@@ -78,11 +79,13 @@ def projects(action: str = "list", project_id: str = "", root: str = "", descrip
 
 
 @_tool()
-def attach_project(project_id: str, max_chars: int = 6500, query: str = "", include_sources: bool = False) -> dict[str, Any]:
-    """Return bounded KB context and a compact map of available KB/repository services."""
+def attach_project(project_id: str, max_chars: int = 6500, query: str = "", include_sources: bool = False,
+                  environment: dict[str, Any] | None = None,
+                  validated_preconditions: list[str] | None = None) -> dict[str, Any]:
+    """Return bounded KB context and repository services. Pass current environment facts and explicitly verified preconditions so lesson applicability can be assessed; compacted packets omit whole lessons with their safeguards."""
     service_map_reserve = min(1_100, max(0, max_chars // 3))
     kb_budget = max_chars if include_sources else max(1, max_chars - service_map_reserve)
-    context = store.attach(project_id, kb_budget, query, include_sources)
+    context = store.attach(project_id, kb_budget, query, include_sources, environment, validated_preconditions)
     try:
         repositories = repository_service.list(project_id)["repositories"]
         availability = "available"
@@ -106,6 +109,7 @@ def attach_project(project_id: str, max_chars: int = 6500, query: str = "", incl
             "error": error},
         "routing": "KB: recorded project intent. Repository: current code. Both: compare code with intent. MCP guidance cannot guarantee tool choice."
     }
+    lesson_count = len(context.get("accepted_lessons", [])) + int(context.get("lessons_omitted_for_budget", 0))
     while len(json.dumps(context, ensure_ascii=False)) > max_chars:
         if include_sources and context["service_catalog"]["repository_indexing"]["repositories"]:
             context["service_catalog"]["repository_indexing"]["repositories"].pop()
@@ -129,6 +133,9 @@ def attach_project(project_id: str, max_chars: int = 6500, query: str = "", incl
         else:
             context["truncated"] = True
             break
+    if lesson_count > len(context.get("accepted_lessons", [])):
+        context["lessons_omitted_for_budget"] = lesson_count - len(context.get("accepted_lessons", []))
+        context["lesson_continuation"] = "Call lessons(action='retrieve') with the same query, environment, and validated_preconditions."
     if len(json.dumps(context, ensure_ascii=False)) > max_chars and not include_sources:
         context = {
             "project": {"id": project_id, "name": context.get("project", {}).get("name", "")},
@@ -144,6 +151,9 @@ def attach_project(project_id: str, max_chars: int = 6500, query: str = "", incl
                     "repositories_truncated": len(repositories) > 1},
                 "routing": "KB=recorded intent; repository=current code; both=compare. Tool choice is not guaranteed."
             },
+            "accepted_lessons": [],
+            "lessons_omitted_for_budget": lesson_count,
+            "lesson_continuation": "Call lessons(action='retrieve') with the same query, environment, and validated_preconditions.",
             "truncated": True,
         }
     return _out(context)
@@ -241,9 +251,11 @@ def claim_task(project_id: str, task_id: str, owner: str, lease_seconds: int = 1
 
 @_tool()
 def task_context(project_id: str, task_id: str, max_chars: int = 12000, requirement_offset: int = 0,
-                 requirements_limit: int = 12, acceptance_offset: int = 0, acceptance_limit: int = 20) -> dict[str, Any]:
-    """Assemble task scope, mandatory applicable requirements, checkpoint, accepted lessons, cited evidence, and freshness notes."""
-    return _out(store.task_context(project_id,task_id,max_chars,requirement_offset,requirements_limit,acceptance_offset,acceptance_limit))
+                 requirements_limit: int = 12, acceptance_offset: int = 0, acceptance_limit: int = 20,
+                 environment: dict[str, Any] | None = None,
+                 validated_preconditions: list[str] | None = None) -> dict[str, Any]:
+    """Assemble bounded task context. Pass current environment facts and explicitly verified preconditions for conservative lesson applicability; lesson safeguards remain attached or the whole lesson is omitted."""
+    return _out(store.task_context(project_id,task_id,max_chars,requirement_offset,requirements_limit,acceptance_offset,acceptance_limit,environment,validated_preconditions))
 
 
 @_tool()
@@ -269,9 +281,10 @@ def lessons(action: str, project_id: str, query: str = "", lesson_id: str = "", 
             outcome: str = "", status: str = "", supersedes: str = "", source_task_id: str = "",
             environment: dict[str, Any] | None = None, confirmed_cause: str = "",
             preconditions: list[str] | None = None, exclusions: list[dict[str, Any]] | None = None,
-            hypotheses: list[str] | None = None) -> dict[str, Any]:
-    """Retrieve accepted lessons, propose a candidate, or review a candidate as accepted/rejected/superseded."""
-    if action == "retrieve": return _out({"lessons":store.search_lessons(project_id,query,environment=environment)})
+            hypotheses: list[str] | None = None,
+            validated_preconditions: list[str] | None = None) -> dict[str, Any]:
+    """Retrieve accepted lesson candidates with safeguards and applicability status; apply procedures only when status is applicable."""
+    if action == "retrieve": return _out({"lessons":store.search_lessons(project_id,query,environment=environment,validated_preconditions=validated_preconditions)})
     if action == "propose": return _out(store.propose_lesson(project_id,title,trigger_text,procedure,evidence,outcome,source_task_id,environment,confirmed_cause,preconditions,exclusions,hypotheses))
     if action == "review": return _out(store.review_lesson(project_id,lesson_id,status,supersedes))
     if action == "show": return _out(store.get_lesson(project_id,lesson_id))

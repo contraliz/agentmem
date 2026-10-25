@@ -2,7 +2,7 @@
 
 This workspace is the reusable Agent Memory MCP module. It is intended to become one component of a larger project-work system; keep the domain/storage layer independent from MCP and CLI adapters.
 
-Each registered project's AgentMem database, compact `PROJECT.md`, and focused `knowledge/*.md` pages live in its own knowledge directory under `D:\projects\<project_id>` by default. Its original repository remains the registered source root. The app registry under `.agentmem-data` is only a locator and migration-backup location; do not treat it as project memory.
+Each registered project's AgentMem database, compact `PROJECT.md`, and focused `knowledge/*.md` pages live in its own knowledge directory under `~/.agentmem/projects/<project_id>` by default on every platform. `AGENTMEM_MEMORY_ROOT` (or CLI `--memory-root`) can select a different parent for new registrations. Existing registrations keep their recorded paths when the default changes. Its original repository remains the registered source root. The app registry under `.agentmem-data` is only a locator and migration-backup location; do not treat it as project memory.
 
 - At the start of project work, call `attach_project` with `project_id="agentmem"` for a compact current brief, task list, accepted lessons, and indexed-source revision.
 - For a factual question, include it as `query` in `attach_project` when orientation is also needed; this returns focused cited evidence in the same call. Use `retrieve_evidence` for a standalone or deeper search, and cite returned paths/lines. If there is no evidence, say what is missing.
